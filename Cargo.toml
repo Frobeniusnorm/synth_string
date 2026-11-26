@@ -1,0 +1,25 @@
+[package]
+name = "synth-string"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+adw = { version = "0.8", package = "libadwaita", features = ["v1_6"] }
+alsa = "0.12.1"
+anyhow = "1.0.105"
+crossbeam-channel = "0.5.17"
+dirs = "7.0.0"
+gtk = { version = "0.10.3", package = "gtk4", features = ["v4_20"] }
+hound = "3.5.1"
+midir = "0.11.2"
+rtrb = "0.4.1"
+rustfft = "6.4.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+symphonia = { version = "0.5", features = ["mp3", "aac", "isomp4", "alac", "flac", "vorbis", "ogg", "wav", "pcm"] }
+
+[profile.dev]
+opt-level = 2
+
+[profile.dev.package."*"]
+opt-level = 2

@@ -1,0 +1,14 @@
+[Desktop Entry]
+Name=Synth String
+GenericName=Guitar Looper
+Comment=Plug-and-play guitar looper with auto-trim, noise reduction and effects
+Exec=synth-string %f
+TryExec=synth-string
+Icon=dev.synthstring.SynthString
+Terminal=false
+Type=Application
+Categories=AudioVideo;Audio;Music;
+Keywords=guitar;looper;loop;record;midi;
+StartupNotify=true
+# X11/XWayland: match windows by class (Wayland uses the app id = file name)
+StartupWMClass=dev.synthstring.SynthString
