@@ -5,6 +5,7 @@ use super::app::{App, TrackModel, fmt_secs};
 use super::track_row;
 use super::widgets::{TRACK_COLORS, compute_peaks};
 use crate::audio::denoise::NoiseProfile;
+use crate::audio::dsp::FILTER_RES;
 use crate::audio::looper::{Command, LoopInfo, RestoreTrack, SR, track_index};
 use crate::project::{self, Project, ProjectMeta, ProjectTrack, TrackMeta};
 use adw::prelude::*;
@@ -21,9 +22,14 @@ fn wave_h(app: &App) -> f64 {
     if app.wide.get() { 132.0 } else { 56.0 }
 }
 
-/// Height of one track lane in song mode.
+/// Height of one track lane in song mode (taller while drawing filter curves).
 fn lane_h(app: &App) -> f64 {
-    if app.wide.get() { 30.0 } else { 22.0 }
+    match (app.wide.get(), app.filter_mode.get()) {
+        (true, true) => 56.0,
+        (false, true) => 40.0,
+        (true, false) => 30.0,
+        (false, false) => 22.0,
+    }
 }
 pub const LANE_GAP: f64 = 4.0;
 
@@ -153,8 +159,146 @@ fn lcm_reps(tracks: &[TrackModel]) -> u32 {
 }
 
 impl App {
-    pub fn loop_len(&self) -> usize {
+    /// Loop length at the original tempo (what the first take set).
+    pub fn base_loop_len(&self) -> usize {
         self.loop_info.get().map(|i| i.len).unwrap_or(0)
+    }
+
+    /// Current loop length in samples (at the global speed).
+    pub fn loop_len(&self) -> usize {
+        let base = self.base_loop_len();
+        let g = self.tempo.get();
+        if (g - 1.0).abs() < 1e-9 { base } else { (base as f64 / g).round() as usize }
+    }
+
+    /// Global speed from the Speed control: debounced, then every track is re-rendered.
+    pub fn set_tempo(self: &Rc<Self>, target: f64) {
+        let target = target.clamp(0.25, 4.0);
+        if self.base_loop_len() == 0 {
+            return;
+        }
+        if self.status.borrow().rec != crate::audio::looper::RecState::Idle {
+            self.toast("Finish recording before changing the speed");
+            self.sync_speed_widget();
+            return;
+        }
+        let generation = self.bump_tempo_gen();
+        let app = self.clone();
+        glib::spawn_future_local(async move {
+            glib::timeout_future(std::time::Duration::from_millis(300)).await;
+            if app.current_tempo_gen() == generation {
+                app.retime_to(target);
+            }
+        });
+    }
+
+    /// Render every track for the speed `target` and switch the engine over in one step.
+    /// Only the absolute time changes: loops, clip positions, patterns and fades keep their
+    /// places relative to the loop.
+    pub fn retime_to(self: &Rc<Self>, target: f64) {
+        let generation = self.bump_tempo_gen();
+        let base = self.base_loop_len();
+        if base == 0 {
+            return;
+        }
+        let cur = ((base as f64 / target).round() as usize).max(1);
+        // beats per loop stay the same: derived from the click grid right now
+        let old_len = self.loop_len().max(1);
+        let beats = (old_len as f64 / (60.0 * SR as f64 / self.cfg.borrow().bpm.max(20.0) as f64)).round().max(1.0);
+        let jobs: Vec<(u32, crate::ui::app::RenderJob)> = {
+            let mut tracks = self.tracks.borrow_mut();
+            let strength = self.cfg.borrow().noise_strength;
+            tracks
+                .iter_mut()
+                .map(|t| {
+                    t.render_gen += 1; // pending single-track renders are for the old speed
+                    t.row.spinner.set_visible(true);
+                    t.row.spinner.start();
+                    let nr = self.nr_active.get() && t.kind == super::app::TrackKind::Recorded;
+                    let profile = t.noise.clone().or_else(|| self.noise_profile.borrow().clone());
+                    let job = crate::ui::app::RenderJob {
+                        raw: t.raw.clone(),
+                        fx: t.fx.clone(),
+                        profile: nr.then_some(profile).flatten(),
+                        strength,
+                        raw_loop: self.track_loop_len(t),
+                        loop_len: cur,
+                    };
+                    (t.id, job)
+                })
+                .collect()
+        };
+        let app = self.clone();
+        glib::spawn_future_local(async move {
+            let rendered = gio::spawn_blocking(move || {
+                jobs.into_iter()
+                    .map(|(id, job)| {
+                        let buf = if job.is_identity() { job.raw.clone() } else { Arc::new(job.run()) };
+                        let peaks = compute_peaks(&buf, 1200);
+                        (id, buf, peaks)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .await;
+            let Ok(rendered) = rendered else { return };
+            if app.current_tempo_gen() != generation {
+                return; // the speed changed again meanwhile
+            }
+            let old_tempo = app.tempo.replace(target);
+            let mut bufs = Vec::new();
+            {
+                let mut tracks = app.tracks.borrow_mut();
+                for (id, buf, peaks) in rendered {
+                    let Some(t) = tracks.iter_mut().find(|t| t.id == id) else { continue };
+                    t.processed = buf.clone();
+                    *t.row.wave.peaks.borrow_mut() = peaks;
+                    t.row.spinner.stop();
+                    t.row.spinner.set_visible(false);
+                    t.row.area.queue_draw();
+                    bufs.push((id, buf));
+                }
+            }
+            let beat_len = cur as f64 / beats;
+            app.send(Command::Retime { loop_len: cur, beat_len, bufs });
+            app.status.borrow_mut().loop_len = cur;
+            // the click follows: same beats per loop at the new tempo
+            let bpm = (60.0 * SR as f64 / beat_len) as f32;
+            app.cfg.borrow_mut().bpm = bpm;
+            app.syncing.set(true);
+            app.ui().bpm_spin.set_value(bpm.round() as f64);
+            app.syncing.set(false);
+            app.sync_speed_widget();
+            app.refresh_song_widgets();
+            app.mark_dirty();
+            if (old_tempo - target).abs() > 1e-9 {
+                app.toast(&format!("Speed ×{target:.2} · {:.0} BPM · loop {}", bpm, fmt_secs(cur)));
+            }
+        });
+    }
+
+    fn bump_tempo_gen(&self) -> u64 {
+        let g = self.tempo_gen_cell().get() + 1;
+        self.tempo_gen_cell().set(g);
+        g
+    }
+
+    fn current_tempo_gen(&self) -> u64 {
+        self.tempo_gen_cell().get()
+    }
+
+    /// Show the current speed in the Speed control (without triggering it).
+    pub fn sync_speed_widget(&self) {
+        let Some(ui) = self.ui.get() else { return };
+        self.syncing.set(true);
+        ui.speed_spin.set_value(self.tempo.get());
+        ui.speed_spin.set_sensitive(self.base_loop_len() > 0);
+        self.syncing.set(false);
+    }
+
+    /// Loop length in a track's raw audio (which was recorded at the speed `rec_tempo`).
+    pub fn track_loop_len(&self, t: &TrackModel) -> usize {
+        let base = self.base_loop_len();
+        if (t.rec_tempo - 1.0).abs() < 1e-9 { base } else { (base as f64 / t.rec_tempo).round() as usize }
     }
 
     /// Number of loop repetitions in one pass through the song.
@@ -173,14 +317,83 @@ impl App {
         fade_envelope(&map, t.fx.fade_in, t.fx.fade_out)
     }
 
+    /// Filter curve as the engine should use it: song mode only, sized to the song, `None` when open.
+    pub fn track_filter(&self, t: &TrackModel) -> Option<Vec<f32>> {
+        if !self.song_mode.get() || t.filter.iter().all(|v| v.abs() < 0.002) {
+            return None;
+        }
+        let n = self.song_reps.get().max(1) as usize * FILTER_RES;
+        let mut c = t.filter.clone();
+        c.resize(n, 0.0); // a shorter song keeps the rest of the curve for later
+        Some(c)
+    }
+
+    fn send_track_arrangement(&self, t: &TrackModel) {
+        self.send(Command::SetTrackMap {
+            id: t.id,
+            map: self.track_map(t).map(Arc::new),
+            env: self.track_env(t).map(Arc::new),
+            filter: self.track_filter(t).map(Arc::new),
+        });
+    }
+
+    pub fn set_filter_mode(&self, on: bool) {
+        self.filter_mode.set(on);
+        self.refresh_song_widgets();
+    }
+
+    /// Draw a filter curve segment on a track (timeline coordinates in repetitions).
+    pub fn draw_filter(&self, lane: usize, from: (f64, f32), to: (f64, f32)) {
+        let reps = self.song_reps.get().max(1) as usize;
+        {
+            let mut tracks = self.tracks.borrow_mut();
+            let Some(t) = tracks.get_mut(lane) else { return };
+            if t.filter.len() < reps * FILTER_RES {
+                t.filter.resize(reps * FILTER_RES, 0.0);
+            }
+            let (a, b) = if from.0 <= to.0 { (from, to) } else { (to, from) };
+            let i0 = (a.0 * FILTER_RES as f64).round().max(0.0) as usize;
+            let i1 = ((b.0 * FILTER_RES as f64).round() as usize).min(reps * FILTER_RES - 1);
+            for i in i0..=i1.max(i0).min(reps * FILTER_RES - 1) {
+                let x = i as f64 / FILTER_RES as f64;
+                let f = if (b.0 - a.0).abs() < 1e-9 { 1.0 } else { ((x - a.0) / (b.0 - a.0)).clamp(0.0, 1.0) as f32 };
+                let v = a.1 + (b.1 - a.1) * f;
+                // snap near the middle to fully open
+                t.filter[i] = if v.abs() < 0.06 { 0.0 } else { v.clamp(-1.0, 1.0) };
+            }
+        }
+        self.mark_dirty();
+        if let Some(t) = self.tracks.borrow().get(lane) {
+            self.send_track_arrangement(t);
+        }
+        if let Some(ui) = self.ui.get() {
+            ui.timeline.queue_draw();
+        }
+    }
+
+    /// Open the filter of one track for one repetition again.
+    pub fn reset_filter_rep(&self, lane: usize, rep: u32) {
+        {
+            let mut tracks = self.tracks.borrow_mut();
+            let Some(t) = tracks.get_mut(lane) else { return };
+            let a = rep as usize * FILTER_RES;
+            for v in t.filter.iter_mut().skip(a).take(FILTER_RES) {
+                *v = 0.0;
+            }
+        }
+        self.mark_dirty();
+        if let Some(t) = self.tracks.borrow().get(lane) {
+            self.send_track_arrangement(t);
+        }
+        if let Some(ui) = self.ui.get() {
+            ui.timeline.queue_draw();
+        }
+    }
+
     pub fn push_arrangement(&self) {
         self.send(Command::SetSongReps(if self.song_mode.get() { self.song_reps.get().max(1) } else { 0 }));
         for t in self.tracks.borrow().iter() {
-            self.send(Command::SetTrackMap {
-                id: t.id,
-                map: self.track_map(t).map(Arc::new),
-                env: self.track_env(t).map(Arc::new),
-            });
+            self.send_track_arrangement(t);
         }
         self.refresh_song_widgets();
     }
@@ -189,11 +402,16 @@ impl App {
         let Some(ui) = self.ui.get() else { return };
         let has_loop = self.loop_len() > 0;
         ui.timeline_card.set_visible(has_loop);
+        ui.speed_spin.set_sensitive(has_loop);
         self.syncing.set(true);
         ui.song_switch.set_active(self.song_mode.get());
         ui.song_reps_spin.set_value(self.song_reps.get() as f64);
         self.syncing.set(false);
         ui.song_reps_box.set_visible(self.song_mode.get());
+        ui.filter_toggle.set_visible(self.song_mode.get());
+        if ui.filter_toggle.is_active() != self.filter_mode.get() {
+            ui.filter_toggle.set_active(self.filter_mode.get());
+        }
         let reps = self.song_reps_effective();
         let total = reps as usize * self.loop_len();
         ui.song_len_label.set_label(&if self.song_mode.get() {
@@ -201,7 +419,9 @@ impl App {
         } else {
             fmt_secs(total)
         });
-        ui.timeline_hint.set_label(if self.song_mode.get() {
+        ui.timeline_hint.set_label(if self.song_mode.get() && self.filter_mode.get() {
+            "Draw on a lane to filter that track: below the middle = less treble, above = less bass · right-click a repetition to open it again"
+        } else if self.song_mode.get() {
             "Click a lane to place or remove a track at that repetition · click the waveform to jump"
         } else {
             "Click the waveform to jump · turn on Song mode to arrange repetitions"
@@ -336,12 +556,13 @@ impl App {
         let tracks = self.tracks.borrow();
         Project {
             meta: ProjectMeta {
-                loop_len: self.loop_len(),
+                loop_len: self.base_loop_len(),
                 bpm: info.map(|i| i.bpm).unwrap_or(cfg.bpm),
                 bars: info.and_then(|i| i.bars),
                 beats_per_bar: cfg.beats_per_bar,
                 song_mode: self.song_mode.get(),
                 song_reps: self.song_reps.get(),
+                tempo: self.tempo.get(),
                 tracks: Vec::new(),
             },
             tracks: tracks
@@ -358,6 +579,8 @@ impl App {
                         clips_everywhere: t.clips.is_none(),
                         kind: t.kind,
                         drum_hits: t.drum_hits.clone(),
+                        filter: t.filter.clone(),
+                        rec_tempo: t.rec_tempo,
                         ..Default::default()
                     },
                     audio: t.raw.to_vec(),
@@ -526,7 +749,9 @@ impl App {
             let tm = pt.meta;
             let raw = Arc::new(pt.audio);
             // slowed-down tracks play longer than the raw take
-            let cycles = (raw.len() * tm.fx.slow_down() / meta.loop_len.max(1)).max(1) as u32;
+            let rec = if tm.rec_tempo > 0.0 { tm.rec_tempo } else { 1.0 };
+            let raw_loop = ((meta.loop_len as f64 / rec).round() as usize).max(1);
+            let cycles = ((raw.len() * tm.fx.slow_down()) as f64 / raw_loop as f64).round().max(1.0) as u32;
             let color = (tm.id.max(1) as usize - 1) % TRACK_COLORS.len();
             let row = track_row::build(self, tm.id, &tm.name, color, &tm.fx, cycles, tm.kind);
             *row.wave.peaks.borrow_mut() = compute_peaks(&raw, 1200);
@@ -548,6 +773,8 @@ impl App {
                 render_gen: 0,
                 cycles,
                 clips,
+                filter: tm.filter.clone(),
+                rec_tempo: if tm.rec_tempo > 0.0 { tm.rec_tempo } else { 1.0 },
                 row,
             };
             restore.push(RestoreTrack {
@@ -567,6 +794,13 @@ impl App {
         self.push_arrangement();
         self.refresh_dim();
         self.refresh_list_visibility();
+        // a project at another speed (or with takes made at other speeds): render everything for it
+        let tempo = if meta.tempo > 0.0 { meta.tempo } else { 1.0 };
+        let mixed = self.tracks.borrow().iter().any(|t| (t.rec_tempo - 1.0).abs() > 1e-9);
+        if (tempo - 1.0).abs() > 1e-9 || mixed {
+            self.retime_to(tempo);
+            return;
+        }
         let ids: Vec<u32> = self
             .tracks
             .borrow()
@@ -602,12 +836,15 @@ pub fn timeline(app: &Rc<App>) -> gtk::DrawingArea {
     }
     let drag = gtk::GestureDrag::new();
     let in_wave = Rc::new(Cell::new(false));
+    // filter drawing in progress: (lane, last point in repetitions, last value)
+    let drawing: Rc<Cell<Option<(usize, f64, f32)>>> = Rc::new(Cell::new(None));
     let start_x = Rc::new(Cell::new(0.0));
     {
         let app = app.clone();
         let a = area.clone();
         let in_wave = in_wave.clone();
         let start_x = start_x.clone();
+        let drawing = drawing.clone();
         drag.connect_drag_begin(move |_, x, y| {
             let w = a.width().max(1) as f64;
             start_x.set(x);
@@ -619,24 +856,75 @@ pub fn timeline(app: &Rc<App>) -> gtk::DrawingArea {
                 if !app.song_mode.get() {
                     return;
                 }
-                let lane = ((y - RULER_H - wave_h(&app)) / (lane_h(&app) + LANE_GAP)).floor() as usize;
+                let Some((lane, value)) = lane_at(&app, y) else { return };
                 let reps = app.song_reps.get().max(1);
-                let rep = ((x / w) * reps as f64).floor() as u32;
-                app.toggle_clip_at(lane, rep);
+                if app.filter_mode.get() {
+                    let r = (x / w) * reps as f64;
+                    drawing.set(Some((lane, r, value)));
+                    app.draw_filter(lane, (r, value), (r, value));
+                } else {
+                    let rep = ((x / w) * reps as f64).floor() as u32;
+                    app.toggle_clip_at(lane, rep);
+                }
             }
         });
     }
     {
         let app = app.clone();
         let a = area.clone();
-        drag.connect_drag_update(move |_, dx, _| {
+        let drawing = drawing.clone();
+        drag.connect_drag_update(move |g, dx, dy| {
+            let w = a.width().max(1) as f64;
             if in_wave.get() {
-                app.seek_fraction((start_x.get() + dx) / a.width().max(1) as f64);
+                app.seek_fraction((start_x.get() + dx) / w);
+            } else if let Some((lane, r0, v0)) = drawing.get()
+                && let Some((sx, sy)) = g.start_point()
+            {
+                // draw from the last point to here (the lane stays the one you started on)
+                let reps = app.song_reps.get().max(1) as f64;
+                let r = ((sx + dx) / w * reps).clamp(0.0, reps);
+                let v = lane_value(&app, lane, sy + dy);
+                app.draw_filter(lane, (r0, v0), (r, v));
+                drawing.set(Some((lane, r, v)));
             }
         });
     }
+    drag.connect_drag_end(move |_, _, _| drawing.set(None));
     area.add_controller(drag);
+
+    // right-click in filter mode: open the filter of that repetition again
+    let right = gtk::GestureClick::builder().button(3).build();
+    {
+        let app = app.clone();
+        let a = area.clone();
+        right.connect_pressed(move |_, _, x, y| {
+            if !(app.song_mode.get() && app.filter_mode.get()) {
+                return;
+            }
+            if let Some((lane, _)) = lane_at(&app, y) {
+                let reps = app.song_reps.get().max(1);
+                app.reset_filter_rep(lane, ((x / a.width().max(1) as f64) * reps as f64).floor() as u32);
+            }
+        });
+    }
+    area.add_controller(right);
     area
+}
+
+/// Lane under `y` and the filter value at that height (top = +1, middle = 0, bottom = −1).
+fn lane_at(app: &App, y: f64) -> Option<(usize, f32)> {
+    let top = RULER_H + wave_h(app) + 4.0;
+    if y < top {
+        return None;
+    }
+    let lane = ((y - top) / (lane_h(app) + LANE_GAP)).floor() as usize;
+    (lane < app.tracks.borrow().len()).then(|| (lane, lane_value(app, lane, y)))
+}
+
+fn lane_value(app: &App, lane: usize, y: f64) -> f32 {
+    let top = RULER_H + wave_h(app) + 4.0 + lane as f64 * (lane_h(app) + LANE_GAP);
+    let mid = top + lane_h(app) / 2.0;
+    (-(y - mid) / (lane_h(app) / 2.0 - 2.0)).clamp(-1.0, 1.0) as f32
 }
 
 fn draw_timeline(app: &App, a: &gtk::DrawingArea, cr: &cairo::Context, w: f64) {
@@ -713,7 +1001,7 @@ fn draw_timeline(app: &App, a: &gtk::DrawingArea, cr: &cairo::Context, w: f64) {
             cr.rectangle(0.0, y, w, lane_h);
             let _ = cr.fill();
             let (r, g, b) = TRACK_COLORS[(t.id.max(1) as usize - 1) % TRACK_COLORS.len()];
-            let dim = t.mute || (any_solo && !t.solo);
+            let dim = t.mute || (any_solo && !t.solo) || app.filter_mode.get();
             let map = map.as_deref().unwrap_or(&[]);
             let mut rep = 0usize;
             while rep < map.len() {
@@ -765,6 +1053,36 @@ fn draw_timeline(app: &App, a: &gtk::DrawingArea, cr: &cairo::Context, w: f64) {
                     }
                 }
                 rep = end;
+            }
+            if app.filter_mode.get() {
+                // filter curve: middle = open, below = less treble, above = less bass
+                let mid = y + lane_h / 2.0;
+                let amp = lane_h / 2.0 - 2.0;
+                cr.set_source_rgba(fr, fgc, fb, 0.25);
+                cr.rectangle(0.0, mid - 0.5, w, 1.0);
+                let _ = cr.fill();
+                let n = reps as usize * FILTER_RES;
+                if t.filter.iter().take(n).any(|v| v.abs() > 0.002) {
+                    let xp = |i: usize| i as f64 / n as f64 * w;
+                    let yp = |i: usize| mid - t.filter.get(i).copied().unwrap_or(0.0) as f64 * amp;
+                    cr.move_to(0.0, mid);
+                    for i in 0..n {
+                        cr.line_to(xp(i), yp(i));
+                    }
+                    cr.line_to(w, yp(n - 1));
+                    cr.line_to(w, mid);
+                    cr.close_path();
+                    cr.set_source_rgba(r, g, b, 0.35);
+                    let _ = cr.fill();
+                    cr.move_to(0.0, yp(0));
+                    for i in 0..n {
+                        cr.line_to(xp(i), yp(i));
+                    }
+                    cr.line_to(w, yp(n - 1));
+                    cr.set_source_rgba(r, g, b, 1.0);
+                    cr.set_line_width(2.0);
+                    let _ = cr.stroke();
+                }
             }
             cr.set_source_rgba(fr, fgc, fb, 0.75);
             cr.move_to(4.0, y + lane_h - 7.0);

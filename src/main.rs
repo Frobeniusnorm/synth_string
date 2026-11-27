@@ -228,6 +228,22 @@ fn debug_hooks(app: &Rc<ui::app::App>) {
         }
     } else if let Some(demo) = std::env::var_os("SYNTH_STRING_DEMO") {
         app.inject_demo();
+        if demo == "tempo" {
+            // everything ×1.5, track 2 a 5th up, a filter sweep drawn on track 1 (song mode)
+            let app = app.clone();
+            glib::timeout_add_local_once(std::time::Duration::from_millis(600), move || {
+                app.set_song_mode(true);
+                app.set_song_reps(6);
+                let id2 = app.tracks.borrow()[1].id;
+                app.set_fx(id2, crate::audio::effects::TrackFx { semitones: 7, ..Default::default() });
+                app.set_filter_mode(true);
+                // close the filter over repetition 2, keep it closed in 3, open it again in 4
+                app.draw_filter(0, (1.0, 0.0), (2.0, -0.8));
+                app.draw_filter(0, (2.0, -0.8), (3.0, -0.8));
+                app.draw_filter(0, (3.0, -0.8), (4.0, 0.0));
+                app.ui().speed_spin.set_value(1.5);
+            });
+        }
         if demo == "slow" {
             // bass at half speed (→ 2 loops long), placed at the last repetition so it wraps around
             let app = app.clone();

@@ -143,7 +143,10 @@ pub fn build(app: &Rc<App>, gtk_app: &adw::Application) {
     let drums_toggle =
         gtk::ToggleButton::builder().label("Drums").tooltip_text("Drum machine – play with A S D").build();
     drums_toggle.add_css_class("metro-toggle");
-    metro_box.append(&drums_toggle);
+    // second group: drums, speed, layer length (moves to its own row in narrow windows)
+    let extra_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    extra_box.set_hexpand(true);
+    extra_box.append(&drums_toggle);
 
     let mult_labels: Vec<String> = super::app::MULTIPLIERS.iter().map(|m| format!("{m}× loop")).collect();
     let mult_refs: Vec<&str> = mult_labels.iter().map(|s| s.as_str()).collect();
@@ -152,7 +155,31 @@ pub fn build(app: &Rc<App>, gtk_app: &adw::Application) {
     mult_dd.set_tooltip_text(Some("Length of new layers"));
     mult_dd.set_halign(gtk::Align::End);
     mult_dd.set_hexpand(true);
-    metro_box.append(&mult_dd);
+    // global speed: everything faster / slower, same pitch, same arrangement
+    let speed_spin = gtk::SpinButton::with_range(0.25, 4.0, 0.05);
+    speed_spin.set_digits(2);
+    speed_spin.set_value(1.0);
+    speed_spin.set_valign(gtk::Align::Center);
+    speed_spin.set_sensitive(false);
+    speed_spin.set_tooltip_text(Some(
+        "Speed of everything (×1.00 = as recorded). Same pitch; loops, clips and patterns stay in place.",
+    ));
+    {
+        let app2 = app.clone();
+        speed_spin.connect_value_changed(move |s| {
+            if !app2.syncing.get() {
+                app2.set_tempo(s.value());
+            }
+        });
+    }
+    let speed_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    speed_box.append(&gtk::Label::builder().label("Speed ×").css_classes(["dim-label"]).build());
+    speed_box.append(&speed_spin);
+    extra_box.append(&speed_box);
+    extra_box.append(&mult_dd);
+    let controls = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    controls.append(&metro_box);
+    controls.append(&extra_box);
 
     {
         let app2 = app.clone();
@@ -201,7 +228,7 @@ pub fn build(app: &Rc<App>, gtk_app: &adw::Application) {
     hero.add_css_class("hero");
     hero.append(&hero_top);
     hero.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-    hero.append(&metro_box);
+    hero.append(&controls);
 
     // ---------------------------------------------------------------- drum machine
     let drum = super::extras::drum_panel(app);
@@ -240,6 +267,21 @@ pub fn build(app: &Rc<App>, gtk_app: &adw::Application) {
     song_reps_box.append(&gtk::Label::builder().label("repetitions").css_classes(["dim-label"]).build());
     song_reps_box.set_visible(false);
     let song_len_label = gtk::Label::builder().css_classes(["dim-label", "numeric"]).build();
+    // lanes: place clips, or draw per-repetition filter curves
+    let filter_toggle = gtk::ToggleButton::builder()
+        .label("Filter")
+        .valign(gtk::Align::Center)
+        .tooltip_text("Draw filter curves on the lanes (less treble / less bass per repetition)")
+        .visible(false)
+        .build();
+    {
+        let app2 = app.clone();
+        filter_toggle.connect_toggled(move |b| {
+            if app2.filter_mode.get() != b.is_active() {
+                app2.set_filter_mode(b.is_active());
+            }
+        });
+    }
     {
         let app2 = app.clone();
         song_switch.connect_active_notify(move |s| {
@@ -260,6 +302,7 @@ pub fn build(app: &Rc<App>, gtk_app: &adw::Application) {
     let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     spacer.set_hexpand(true);
     tl_head.append(&spacer);
+    tl_head.append(&filter_toggle);
     tl_head.append(&song_reps_box);
     tl_head.append(&gtk::Label::new(Some("Song mode")));
     tl_head.append(&song_switch);
@@ -376,6 +419,10 @@ pub fn build(app: &Rc<App>, gtk_app: &adw::Application) {
         wide.connect_unapply(move |_| app.set_wide(false));
     }
     window.add_breakpoint(wide);
+    // narrow windows: the transport controls take two rows
+    let narrow = adw::Breakpoint::new(adw::BreakpointCondition::parse("max-width: 880sp").expect("breakpoint"));
+    narrow.add_setter(&controls, "orientation", Some(&gtk::Orientation::Vertical.to_value()));
+    window.add_breakpoint(narrow);
 
     install_keys(app, &window);
 
@@ -415,6 +462,8 @@ pub fn build(app: &Rc<App>, gtk_app: &adw::Application) {
         timeline,
         timeline_hint,
         song_switch,
+        filter_toggle,
+        speed_spin,
         song_reps_spin,
         song_reps_box,
         song_len_label,

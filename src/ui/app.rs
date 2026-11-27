@@ -48,6 +48,10 @@ pub struct TrackModel {
     pub cycles: u32,
     /// Song-mode placement (clip start repetitions); `None` = everywhere.
     pub clips: Option<Vec<u32>>,
+    /// Song-mode filter curve (`dsp::FILTER_RES` points per repetition, −1 … 1); empty = open.
+    pub filter: Vec<f32>,
+    /// Global speed the raw audio was recorded / made at (1.0 = the original tempo).
+    pub rec_tempo: f64,
     pub row: TrackRow,
 }
 
@@ -87,6 +91,8 @@ pub struct Ui {
     pub timeline: gtk::DrawingArea,
     pub timeline_hint: gtk::Label,
     pub song_switch: gtk::Switch,
+    pub filter_toggle: gtk::ToggleButton,
+    pub speed_spin: gtk::SpinButton,
     pub song_reps_spin: gtk::SpinButton,
     pub song_reps_box: gtk::Box,
     pub song_len_label: gtk::Label,
@@ -133,6 +139,11 @@ pub struct App {
     pub song_mode: Cell<bool>,
     /// Wide window (breakpoint): bigger timeline, hero and drum machine side by side.
     pub wide: Cell<bool>,
+    /// Timeline lanes edit filter curves instead of clip placement.
+    pub filter_mode: Cell<bool>,
+    /// Global speed factor (1.0 = original tempo); every track plays sped up / slowed down by it.
+    pub tempo: Cell<f64>,
+    pub(super) tempo_gen: Cell<u64>,
     pub song_reps: Cell<u32>,
     pub project_path: RefCell<Option<std::path::PathBuf>>,
     pub dirty: Cell<bool>,
@@ -186,6 +197,9 @@ impl App {
             ticks: Cell::new(0),
             song_mode: Cell::new(false),
             wide: Cell::new(false),
+            filter_mode: Cell::new(false),
+            tempo: Cell::new(1.0),
+            tempo_gen: Cell::new(0),
             song_reps: Cell::new(0),
             project_path: RefCell::new(None),
             dirty: Cell::new(false),
@@ -560,7 +574,16 @@ impl App {
         }
         let (id, len) = match replace {
             Some(id) => {
-                let len = self.tracks.borrow().iter().find(|t| t.id == id).map(|t| t.raw.len()).unwrap_or(loop_len);
+                // the new take is recorded at the current speed: same number of loops as now
+                let len = self
+                    .tracks
+                    .borrow()
+                    .iter()
+                    .find(|t| t.id == id)
+                    .map(|t| {
+                        (t.raw.len() as f64 / self.track_loop_len(t).max(1) as f64).round().max(1.0) as usize * loop_len
+                    })
+                    .unwrap_or(loop_len);
                 (id, len)
             }
             None => {
@@ -621,6 +644,9 @@ impl App {
         }
         self.loop_info.set(None);
         self.status.borrow_mut().loop_len = 0;
+        self.tempo.set(1.0);
+        self.tempo_gen.set(self.tempo_gen.get() + 1);
+        self.sync_speed_widget();
         self.next_id.set(1);
         self.mark_dirty();
         self.refresh_list_visibility();
@@ -639,12 +665,18 @@ impl App {
             let t = tracks.remove(i);
             self.ui().list.remove(&t.row.row);
         }
-        if tracks.is_empty() {
+        let emptied = tracks.is_empty();
+        if emptied {
             self.loop_info.set(None);
             self.status.borrow_mut().loop_len = 0;
             self.next_id.set(1);
+            self.tempo.set(1.0);
+            self.tempo_gen.set(self.tempo_gen.get() + 1);
         }
         drop(tracks);
+        if emptied {
+            self.sync_speed_widget();
+        }
         self.mark_dirty();
         self.refresh_list_visibility();
         self.refresh_song_widgets();
@@ -706,8 +738,9 @@ impl App {
     // ------------------------------------------------------------ tracks / effects
 
     fn add_track_model(self: &Rc<Self>, id: u32, raw: Arc<Vec<f32>>, noise: Vec<f32>, clips: Option<Vec<u32>>) {
-        let loop_len = self.loop_info.get().map(|i| i.len).unwrap_or(raw.len()).max(1);
-        let cycles = (raw.len() / loop_len).max(1) as u32;
+        // new tracks are made at the current speed
+        let loop_len = if self.loop_len() > 0 { self.loop_len() } else { raw.len().max(1) };
+        let cycles = ((raw.len() as f64 / loop_len as f64).round() as u32).max(1);
         let (name, kind) =
             self.pending_meta.borrow_mut().remove(&id).unwrap_or((format!("Track {id}"), TrackKind::Recorded));
         let fx = TrackFx::default();
@@ -735,6 +768,8 @@ impl App {
             render_gen: 0,
             cycles,
             clips,
+            filter: Vec::new(),
+            rec_tempo: self.tempo.get(),
             row,
         });
         self.mark_dirty();
@@ -759,11 +794,16 @@ impl App {
     pub fn fill_fx(self: &Rc<Self>, id: u32, popover: &gtk::Popover) {
         let Some(fx) = self.tracks.borrow().iter().find(|t| t.id == id).map(|t| t.fx.clone()) else { return };
         let app = self.clone();
-        let bpm = self.cfg.borrow().bpm;
-        let bpm = self.loop_info.get().map(|i| i.bpm).unwrap_or(bpm);
-        let l = self.loop_len().max(1);
-        let raw_loops =
-            self.tracks.borrow().iter().find(|t| t.id == id).map(|t| (t.raw.len() / l).max(1) as u32).unwrap_or(1);
+        // effects run on the raw audio: tempo-synced echo uses the tempo the track was made at
+        let rec = self.tracks.borrow().iter().find(|t| t.id == id).map(|t| t.rec_tempo).unwrap_or(1.0);
+        let bpm = (self.cfg.borrow().bpm as f64 * rec / self.tempo.get()) as f32;
+        let raw_loops = self
+            .tracks
+            .borrow()
+            .iter()
+            .find(|t| t.id == id)
+            .map(|t| (t.raw.len() / self.track_loop_len(t).max(1)).max(1) as u32)
+            .unwrap_or(1);
         let content = super::fx::fx_content(fx, bpm, raw_loops, move |fx| app.set_fx(id, fx));
         popover.set_child(Some(&content));
     }
@@ -791,6 +831,24 @@ impl App {
         self.push_arrangement();
     }
 
+    pub(super) fn tempo_gen_cell(&self) -> &Cell<u64> {
+        &self.tempo_gen
+    }
+
+    /// Map an index into a track's processed (heard) audio back to its raw audio: undoes the
+    /// global speed stretch, the track's own speed and reverse.
+    pub fn raw_index(&self, t: &TrackModel, idx: usize) -> usize {
+        let pre = t.raw.len() * t.fx.slow_down(); // length before the global speed stage
+        let heard = t.processed.len().max(1);
+        let i = (idx as u128 * pre as u128 / heard as u128) as usize;
+        t.fx.source_index(i, t.raw.len())
+    }
+
+    /// Length of one beat in a track's raw audio (drum patterns live there).
+    pub fn drum_beat_for(&self, t: &TrackModel) -> f64 {
+        self.drum_beat() / t.rec_tempo.max(0.01)
+    }
+
     /// Re-render a track (noise reduction + effects) in the background, debounced.
     pub fn reprocess(self: &Rc<Self>, id: u32) {
         let generation = {
@@ -814,15 +872,19 @@ impl App {
                 let nr = app.nr_active.get() && t.kind == TrackKind::Recorded;
                 let profile = t.noise.clone().or_else(|| app.noise_profile.borrow().clone());
                 let strength = app.cfg.borrow().noise_strength;
-                (t.raw.clone(), t.fx.clone(), nr.then_some(profile).flatten(), strength)
+                
+                RenderJob {
+                    raw: t.raw.clone(),
+                    fx: t.fx.clone(),
+                    profile: nr.then_some(profile).flatten(),
+                    strength,
+                    raw_loop: app.track_loop_len(t),
+                    loop_len: app.loop_len(),
+                }
             };
-            let (raw, fx, profile, strength) = job;
+            let cur = job.loop_len;
             let result = gio::spawn_blocking(move || {
-                let base: Vec<f32> = match &profile {
-                    Some(p) => denoise::reduce(&raw, p, strength),
-                    None => raw.to_vec(),
-                };
-                let out = effects::render(&base, &fx, SR as f32);
+                let out = job.run();
                 let peaks = compute_peaks(&out, 1200);
                 (out, peaks)
             })
@@ -830,8 +892,8 @@ impl App {
             let Ok((out, peaks)) = result else { return };
             let mut tracks = app.tracks.borrow_mut();
             let Some(t) = tracks.iter_mut().find(|t| t.id == id) else { return };
-            if t.render_gen != generation {
-                return;
+            if t.render_gen != generation || app.loop_len() != cur {
+                return; // superseded (newer edit or a speed change, which renders everything)
             }
             let buf = Arc::new(out);
             // slowing down changes how many loops the track lasts
@@ -1012,6 +1074,7 @@ impl App {
                         if let Some(t) = tracks.iter_mut().find(|t| t.id == track_id) {
                             t.raw = raw.clone();
                             t.processed = raw.clone();
+                            t.rec_tempo = self.tempo.get(); // the new take is at the current speed
                             // a song-mode take can be one repetition longer than before
                             let cycles = (raw.len() / l).max(1) as u32;
                             if cycles != t.cycles {
@@ -1192,7 +1255,9 @@ impl App {
                     let bars = info
                         .and_then(|i| i.bars.map(|b| format!("{b} bar{} · ", if b == 1 { "" } else { "s" })))
                         .unwrap_or_default();
-                    let bpm = info.map(|i| format!("{:.0} BPM · ", i.bpm)).unwrap_or_default();
+                    let bpm = info.map(|_| format!("{:.0} BPM · ", self.cfg.borrow().bpm)).unwrap_or_default();
+                    let speed = self.tempo.get();
+                    let bpm = if (speed - 1.0).abs() > 1e-9 { format!("{bpm}×{speed:.2} · ") } else { bpm };
                     (
                         if st.playing { "Looping".into() } else { "Paused".into() },
                         format!(
@@ -1383,6 +1448,7 @@ impl App {
                     map: self.track_map(t),
                     env: self.track_env(t),
                     fade: (t.fx.fade_in, t.fx.fade_out),
+                    filter: self.track_filter(t),
                 })
                 .collect()
         };
@@ -1417,5 +1483,38 @@ impl App {
                 Err(_) => app.toast("Export failed"),
             }
         });
+    }
+}
+
+/// Everything needed to render one track in the background: noise reduction → effects → global
+/// speed (stretch from the speed the take was recorded at to the current loop length).
+pub struct RenderJob {
+    pub raw: Arc<Vec<f32>>,
+    pub fx: TrackFx,
+    pub profile: Option<NoiseProfile>,
+    pub strength: f32,
+    /// Loop length in the raw audio's own time.
+    pub raw_loop: usize,
+    /// Current loop length (at the current global speed).
+    pub loop_len: usize,
+}
+
+impl RenderJob {
+    /// Whether the result would just be the raw audio.
+    pub fn is_identity(&self) -> bool {
+        self.profile.is_none() && self.fx.is_neutral() && self.raw_loop == self.loop_len
+    }
+
+    pub fn run(&self) -> Vec<f32> {
+        let base: Vec<f32> = match &self.profile {
+            Some(p) => denoise::reduce(&self.raw, p, self.strength),
+            None => self.raw.to_vec(),
+        };
+        let out = effects::render(&base, &self.fx, SR as f32);
+        if self.raw_loop == self.loop_len || self.raw_loop == 0 {
+            return out;
+        }
+        let cycles = ((out.len() as f64 / self.raw_loop as f64).round() as usize).max(1);
+        effects::stretch_circular(&out, cycles * self.loop_len)
     }
 }

@@ -13,6 +13,8 @@ pub struct TrackFx {
     pub speed: f32,
     /// −2..=2 octaves.
     pub octave: i32,
+    /// Interval on top of the octave, in semitones (−11..=11; +5 = a 4th up, +7 = a 5th up).
+    pub semitones: i32,
     /// 0 = dry only, 1 = shifted only.
     pub octave_blend: f32,
     pub drive: bool,
@@ -39,6 +41,7 @@ impl Default for TrackFx {
         Self {
             speed: 1.0,
             octave: 0,
+            semitones: 0,
             octave_blend: 1.0,
             drive: false,
             drive_amount: 0.3,
@@ -80,6 +83,15 @@ impl TrackFx {
         if self.reverse { raw_len - 1 - i } else { i }
     }
 
+    pub fn shifts_pitch(&self) -> bool {
+        self.octave != 0 || self.semitones != 0
+    }
+
+    /// Pitch ratio of octave + interval (2.0 = one octave up).
+    pub fn pitch_ratio(&self) -> f32 {
+        2f32.powf(self.octave as f32 + self.semitones as f32 / 12.0)
+    }
+
     /// The same settings without the fades (which don't change the rendered sound).
     pub fn sound(&self) -> TrackFx {
         TrackFx { fade_in: 0, fade_out: 0, ..self.clone() }
@@ -91,7 +103,7 @@ impl TrackFx {
 
     /// No effect changes the sound (fades are a volume curve and don't count).
     pub fn is_neutral(&self) -> bool {
-        (self.octave == 0 || self.octave_blend <= 0.0)
+        (!self.shifts_pitch() || self.octave_blend <= 0.0)
             && self.speed_up() == 1
             && self.slow_down() == 1
             && !self.drive
@@ -110,8 +122,12 @@ impl TrackFx {
             (_, n) if n > 1 => parts.push(format!("1/{n}× speed")),
             _ => {}
         }
-        if self.octave != 0 && self.octave_blend > 0.0 {
-            parts.push(format!("Oct {:+}", self.octave));
+        if self.shifts_pitch() && self.octave_blend > 0.0 {
+            match (self.octave, self.semitones) {
+                (o, 0) => parts.push(format!("Oct {o:+}")),
+                (0, s) => parts.push(interval_name(s).to_string()),
+                (o, s) => parts.push(format!("Oct {o:+} {}", interval_name(s))),
+            }
         }
         if self.reverse {
             parts.push("Reverse".into());
@@ -140,6 +156,40 @@ impl TrackFx {
     }
 }
 
+/// Short name of an interval in semitones ("4th up", "5th down", …).
+pub fn interval_name(semitones: i32) -> &'static str {
+    const UP: [&str; 12] = [
+        "Unison",
+        "Minor 2nd up",
+        "2nd up",
+        "Minor 3rd up",
+        "3rd up",
+        "4th up",
+        "Tritone up",
+        "5th up",
+        "Minor 6th up",
+        "6th up",
+        "Minor 7th up",
+        "7th up",
+    ];
+    const DOWN: [&str; 12] = [
+        "Unison",
+        "Minor 2nd down",
+        "2nd down",
+        "Minor 3rd down",
+        "3rd down",
+        "4th down",
+        "Tritone down",
+        "5th down",
+        "Minor 6th down",
+        "6th down",
+        "Minor 7th down",
+        "7th down",
+    ];
+    let i = (semitones.unsigned_abs() as usize).min(11);
+    if semitones >= 0 { UP[i] } else { DOWN[i] }
+}
+
 /// Render `fx` onto one loop cycle `x`. The length is preserved, except when slowing down
 /// (then it is `slow_down()` times longer).
 pub fn render(x: &[f32], fx: &TrackFx, sr: f32) -> Vec<f32> {
@@ -156,8 +206,8 @@ pub fn render(x: &[f32], fx: &TrackFx, sr: f32) -> Vec<f32> {
         cycle = slow_down_circular(&cycle, fx.slow_down());
     }
     let len = cycle.len();
-    if fx.octave != 0 && fx.octave_blend > 0.0 {
-        let shifted = pitch_shift_circular(&cycle, 2f32.powi(fx.octave));
+    if fx.shifts_pitch() && fx.octave_blend > 0.0 {
+        let shifted = pitch_shift_circular(&cycle, fx.pitch_ratio());
         let b = fx.octave_blend.clamp(0.0, 1.0);
         // equal-ish power blend, compensate level of the shifted signal
         cycle = cycle.iter().zip(&shifted).map(|(d, s)| d * (1.0 - b) + s * b).collect();
@@ -382,6 +432,24 @@ pub fn slow_down_circular(x: &[f32], factor: usize) -> Vec<f32> {
     (0..n).map(|i| lerp_at(&stretched, (n + i) as f64)).collect()
 }
 
+/// Stretch a loop to exactly `target` samples without changing its pitch (any ratio, used for the
+/// global speed). Rendered circularly → seamless.
+pub fn stretch_circular(x: &[f32], target: usize) -> Vec<f32> {
+    let len = x.len();
+    if len == 0 || target == 0 {
+        return vec![0.0; target];
+    }
+    if target == len {
+        return x.to_vec();
+    }
+    let ratio = target as f64 / len as f64;
+    let tiled: Vec<f32> = x.iter().chain(x).chain(x).copied().collect();
+    let stretched = time_stretch(&tiled, ratio as f32);
+    // the phase vocoder's output length is approximate: read the middle copy on its own scale
+    let scale = stretched.len() as f64 / (3 * len) as f64;
+    (0..target).map(|i| lerp_at(&stretched, (len as f64 + i as f64 / ratio) * scale)).collect()
+}
+
 /// Duration-preserving pitch shift by `ratio` (2.0 = one octave up) for a loop: the loop is
 /// processed as three repetitions and the middle one is kept, so the result is seamless.
 pub fn pitch_shift_circular(x: &[f32], ratio: f32) -> Vec<f32> {
@@ -538,6 +606,19 @@ mod tests {
     }
 
     #[test]
+    fn fifth_up_raises_by_three_halves() {
+        let sr = 48000.0;
+        let x = sine(220.0, sr, 48000, 0.5);
+        let fx = TrackFx { semitones: 7, ..Default::default() };
+        let y = render(&x, &fx, sr);
+        assert_eq!(y.len(), x.len());
+        let f = peak_frequency(&y[4000..44000], sr);
+        assert!((f - 329.6).abs() < 6.0, "a 5th above 220 Hz is ~329.6 Hz, got {f}");
+        assert_eq!(fx.summary(), "5th up");
+        assert_eq!(interval_name(-5), "4th down");
+    }
+
+    #[test]
     fn octave_down_halves_frequency() {
         let sr = 48000.0;
         let x = sine(330.0, sr, 48000, 0.5);
@@ -603,6 +684,18 @@ mod tests {
         // old projects stored the speed as an integer
         let old: TrackFx = serde_json::from_str(r#"{"speed": 4}"#).unwrap();
         assert_eq!(old.speed_up(), 4);
+    }
+
+    #[test]
+    fn global_stretch_keeps_pitch_and_exact_length() {
+        let sr = 48000.0;
+        let x = sine(220.0, sr, 48000, 0.5);
+        for target in [38400usize, 60000] {
+            let y = stretch_circular(&x, target);
+            assert_eq!(y.len(), target);
+            let f = peak_frequency(&y[2000..target - 2000], sr);
+            assert!((f - 220.0).abs() < 6.0, "pitch changed: {f} (target {target})");
+        }
     }
 
     #[test]

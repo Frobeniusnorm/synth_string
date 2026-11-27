@@ -20,15 +20,23 @@ A plug-and-play guitar looper for GNOME (GTK 4 + libadwaita, Rust).
   started in, and runs into the next one if you started mid-repetition. New layers can be 1×, 2×, 3×, 4×, 6× or 8× the loop. A clip
   that runs past the last repetition wraps around to the start, because the song loops. In the export it
   instead finishes after the last pass.
+- **Filter curves** (song mode): switch the timeline to *Filter* and draw on a track's lane. Below the middle
+  line means less treble (low-pass), above it less bass (high-pass). The drawn shape, such as a slow close
+  over one repetition and opening again later, is saved, plays back every time and is exported.
+  Right-click a repetition to open the filter again.
 - **Projects**: save and open `*.synthstring` files (Ctrl+S / Ctrl+O). They keep the raw takes, effects,
   noise profiles, mix and arrangement, so everything stays editable. You can also open a project with
   `synth-string song.synthstring`.
+- **Global speed** (×0.25–×4, any value): everything plays faster or slower at the same pitch. Only the
+  absolute time changes: loop length, click and BPM follow, while clips, track lengths in loops, drum
+  patterns, fades and filter curves keep their places. Recorded audio is never altered, because each
+  track remembers the speed it was recorded at, so ×1.00 always sounds exactly as recorded.
 - **Metronome** with tap tempo. With the click on, loops snap to whole bars.
 - **Noise reduction**: a live noise gate on the monitor, plus spectral noise reduction on recorded
   takes. It switches on automatically when the input is noisy.
 - **Per-track FX** (non-destructive): speed at the same pitch, either 2–4× faster (the track repeats to
   fill its slot) or ½× / ¼× slower (the track becomes 2× / 4× as long),
-  octave changer (−2…+2, with blend), drive, tone, tempo-synced echo, reverb, reverse, and fade in / out
+  pitch shift by octaves (−2…+2) and/or an interval (e.g. a 4th or 5th up or down, with blend), drive, tone, tempo-synced echo, reverb, reverse, and fade in / out
   over 1–8 repetitions. In song mode a fade applies to each stretch of repetitions the track plays in, and
   the timeline lane shows the volume curve. In loop mode it applies to the start and end of the export.
 - **Import audio** (MP3, WAV, FLAC, OGG, M4A/AAC, ALAC, AIFF; Ctrl+I). With no loop yet, the file (silence
@@ -91,7 +99,7 @@ The dock / dash icon comes from the installed `.desktop` file: GNOME matches the
 | `src/ui/song.rs` | Song mode, timeline widget, project save/load UI |
 | `src/ui/*` | libadwaita UI |
 
-Developer hooks: `SYNTH_STRING_DEMO=1` (or `=song`, `=drums`, `=slow`) injects synthetic loops or plays a demo
+Developer hooks: `SYNTH_STRING_DEMO=1` (or `=song`, `=drums`, `=slow`, `=tempo`) injects synthetic loops or plays a demo
 beat, `SYNTH_STRING_IMPORT=file.mp3` imports at startup, `SYNTH_STRING_SIZE=1700x1000` sets the window size,
 `SYNTH_STRING_SWITCH=1` cycles the input device
 (regression test for device switching), `SYNTH_STRING_SNAPSHOT=out.png` renders

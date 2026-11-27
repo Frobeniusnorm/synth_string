@@ -68,6 +68,8 @@ pub enum Command {
         map: Option<RepMap>,
         /// Volume per repetition (fade in / out); `None` = full volume.
         env: Option<Envelope>,
+        /// Filter curve over the song (`FILTER_RES` points per repetition); `None` = open.
+        filter: Option<Arc<Vec<f32>>>,
     },
     /// Song length in loop repetitions; 0 = automatic (just loop the tracks).
     SetSongReps(u32),
@@ -79,6 +81,13 @@ pub enum Command {
     DrumHit {
         drum: u8,
         snap: u8,
+    },
+    /// Global speed change: new loop length and beat, and every track's audio rendered for it
+    /// (all at once, so lengths never mismatch). The play position keeps its place in the song.
+    Retime {
+        loop_len: usize,
+        beat_len: f64,
+        bufs: Vec<(u32, Buffer)>,
     },
     /// Replace everything with a loaded project (starts paused).
     Restore {
@@ -196,11 +205,26 @@ struct Track {
     solo: bool,
     map: Option<RepMap>,
     env: Option<Envelope>,
+    filter: Option<Arc<Vec<f32>>>,
+    filter_state: super::dsp::TrackFilter,
+    /// One block of this track, rendered ahead when it has a filter.
+    scratch: Vec<f32>,
 }
 
 impl Track {
     fn new(id: u32, buf: Buffer) -> Self {
-        Self { id, buf, gain: 1.0, mute: false, solo: false, map: None, env: None }
+        Self {
+            id,
+            buf,
+            gain: 1.0,
+            mute: false,
+            solo: false,
+            map: None,
+            env: None,
+            filter: None,
+            filter_state: Default::default(),
+            scratch: Vec::with_capacity(4096),
+        }
     }
 }
 
@@ -442,10 +466,11 @@ impl Looper {
                     }
                     self.tracks.push(Track::new(id, buf));
                 }
-                Command::SetTrackMap { id, map, env } => {
+                Command::SetTrackMap { id, map, env, filter } => {
                     if let Some(t) = self.tracks.iter_mut().find(|t| t.id == id) {
                         t.map = map;
                         t.env = env;
+                        t.filter = filter;
                     }
                 }
                 Command::SetSongReps(r) => self.song_reps = r,
@@ -459,6 +484,29 @@ impl Looper {
                         self.update_song_len();
                         self.abs = p % self.song_len.max(1) as u64;
                     }
+                }
+                Command::Retime { loop_len, beat_len, bufs } => {
+                    if self.loop_len == 0 || loop_len == 0 {
+                        self.garbage.extend(bufs.into_iter().map(|(_, b)| b));
+                        continue;
+                    }
+                    self.cancel();
+                    let old = self.loop_len as f64;
+                    self.abs = (self.abs as f64 * loop_len as f64 / old) as u64;
+                    self.loop_len = loop_len;
+                    self.loop_beat_len = beat_len;
+                    self.metro.bpm = (60.0 * SR as f64 / beat_len) as f32;
+                    for (id, buf) in bufs {
+                        match self.tracks.iter_mut().find(|t| t.id == id) {
+                            Some(t) => {
+                                let old = std::mem::replace(&mut t.buf, buf);
+                                self.garbage.push(old);
+                            }
+                            None => self.garbage.push(buf),
+                        }
+                    }
+                    self.update_song_len();
+                    self.abs %= self.song_len.max(1) as u64;
                 }
                 Command::Restore { loop_len, beat_len, tracks } => {
                     self.cancel();
@@ -474,6 +522,9 @@ impl Looper {
                             solo: t.solo,
                             map: t.map,
                             env: None,
+                            filter: None,
+                            filter_state: Default::default(),
+                            scratch: Vec::with_capacity(4096),
                         });
                     }
                     self.loop_len = loop_len;
@@ -738,12 +789,35 @@ impl Looper {
         let metro_on = self.metro.enabled && (self.playing || self.loop_len == 0);
         let beat_len = self.beat_len();
         let bpb = self.metro.beats_per_bar.max(1) as u64;
+        // tracks with a filter curve: render this block ahead and filter it as a whole
+        let playing_loop = self.playing && self.loop_len > 0;
+        if playing_loop {
+            let (abs0, l) = (self.abs, self.loop_len);
+            for t in self.tracks.iter_mut() {
+                let Some(curve) = t.filter.clone() else { continue };
+                t.scratch.clear();
+                for k in 0..n as u64 {
+                    let a = (abs0 + k) % song_len;
+                    let v = match track_index(a, l, t.buf.len(), t.map.as_deref().map(|v| v.as_slice())) {
+                        Some(i) => t.buf[i] * t.env.as_deref().map_or(1.0, |e| env_gain(a, l, e)),
+                        None => 0.0,
+                    };
+                    t.scratch.push(v);
+                }
+                let target = super::dsp::filter_at(&curve, abs0, l);
+                t.filter_state.process(&mut t.scratch, target, SR as f32);
+            }
+        }
         for i in 0..n {
             let mut s = 0.0f32;
-            if self.playing && self.loop_len > 0 {
+            if playing_loop {
                 let a = self.abs;
                 for t in &self.tracks {
                     if t.mute || (any_solo && !t.solo) {
+                        continue;
+                    }
+                    if t.filter.is_some() {
+                        s += t.scratch.get(i).copied().unwrap_or(0.0) * t.gain;
                         continue;
                     }
                     if let Some(i) = track_index(a, self.loop_len, t.buf.len(), t.map.as_deref().map(|v| v.as_slice()))
@@ -1111,6 +1185,27 @@ mod tests {
         // in between the edge fades the take only rises: it is in playing order
         let body = &out[off + 500..off + 48000 - 500];
         assert!(body.windows(2).all(|w| w[1] > w[0]), "take is out of order");
+    }
+
+    #[test]
+    fn retime_scales_loop_and_position() {
+        let (mut l, tx, _rx) = looper();
+        l.loop_len = 1000;
+        l.loop_beat_len = 250.0;
+        l.tracks.push(Track::new(1, Arc::new(vec![0.1; 2000])));
+        l.playing = true;
+        tx.send(Command::SetSongReps(4)).unwrap();
+        tx.send(Command::Seek(2500)).unwrap();
+        l.handle_commands();
+        // 1.25× faster: loop 800, beat 200, buffers rendered for it
+        tx.send(Command::Retime { loop_len: 800, beat_len: 200.0, bufs: vec![(1, Arc::new(vec![0.2; 1600]))] })
+            .unwrap();
+        l.handle_commands();
+        assert_eq!(l.loop_len, 800);
+        assert_eq!(l.song_len, 3200, "song keeps its 4 repetitions");
+        assert_eq!(l.abs, 2000, "same place in the song (repetition 3, half way)");
+        assert_eq!(l.tracks[0].buf.len(), 1600);
+        assert!((l.metro.bpm - 14400.0).abs() < 1.0, "click follows: 60 s / 200 samples");
     }
 
     #[test]

@@ -15,6 +15,8 @@ pub struct ExportTrack {
     pub env: Option<Vec<(f32, f32)>>,
     /// Loop mode (no `map`): fade in / out over this many loops at the start / end of the export.
     pub fade: (u32, u32),
+    /// Song-mode filter curve (see `dsp::filter_at`).
+    pub filter: Option<Vec<f32>>,
 }
 
 pub struct Song {
@@ -64,7 +66,7 @@ fn render(t: &ExportTrack, song: &Song, total: usize) -> Vec<f32> {
         }
         g
     };
-    (0..total)
+    let mut out: Vec<f32> = (0..total)
         .map(|i| {
             let pass = i / song_len;
             let pos = (i % song_len) as u64;
@@ -80,7 +82,16 @@ fn render(t: &ExportTrack, song: &Song, total: usize) -> Vec<f32> {
                 _ => 0.0,
             }
         })
-        .collect()
+        .collect();
+    // the same per-block filter the engine uses
+    if let Some(curve) = &t.filter {
+        let mut f = crate::audio::dsp::TrackFilter::default();
+        for (b, block) in out.chunks_mut(256).enumerate() {
+            let pos = ((b * 256) % song_len) as u64;
+            f.process(block, crate::audio::dsp::filter_at(curve, pos, song.loop_len), SR as f32);
+        }
+    }
+    out
 }
 
 fn fade_out(x: &mut [f32]) {
@@ -143,6 +154,7 @@ mod tests {
                 map: None,
                 env: None,
                 fade: (0, 0),
+                filter: None,
             },
             // a "solo" only in repetition 2
             ExportTrack {
@@ -153,6 +165,7 @@ mod tests {
                 map: Some(vec![-1, 1, -1]),
                 env: None,
                 fade: (0, 0),
+                filter: None,
             },
         ];
         let song = Song { loop_len: 4000, song_len: 12000, repeats: 1 };
@@ -181,6 +194,7 @@ mod tests {
             map: Some(vec![2, -1, 2]),
             env: None,
             fade: (0, 0),
+            filter: None,
         };
         let song = Song { loop_len: 1000, song_len: 3000, repeats: 2 };
         assert_eq!(wrap_tail(&t, 1000), 1000);
@@ -202,6 +216,7 @@ mod tests {
             map: None,
             env: None,
             fade: (1, 2),
+            filter: None,
         };
         let song = Song { loop_len: 1000, song_len: 1000, repeats: 4 };
         let y = render(&t, &song, 4000);

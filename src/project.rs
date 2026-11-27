@@ -23,6 +23,8 @@ pub struct ProjectMeta {
     pub beats_per_bar: u32,
     pub song_mode: bool,
     pub song_reps: u32,
+    /// Global speed factor (missing / 0 in older projects = 1.0).
+    pub tempo: f64,
     pub tracks: Vec<TrackMeta>,
 }
 
@@ -41,6 +43,10 @@ pub struct TrackMeta {
     pub clips_everywhere: bool,
     pub kind: crate::ui::app::TrackKind,
     pub drum_hits: Vec<crate::audio::drums::Hit>,
+    /// Song-mode filter curve (see `TrackModel::filter`).
+    pub filter: Vec<f32>,
+    /// Global speed the audio was recorded at (missing / 0 in older projects = 1.0).
+    pub rec_tempo: f64,
     pub len: usize,
     pub noise_len: usize,
 }

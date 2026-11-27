@@ -101,7 +101,7 @@ pub fn fx_content(
     content.append(&speed);
 
     // ---- Octave
-    let (oct, _) = section("Octave", "Shift the whole track up or down");
+    let (oct, _) = section("Pitch", "Shift the whole track by octaves and/or an interval");
     let seg = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     seg.add_css_class("linked");
     seg.set_homogeneous(true);
@@ -127,6 +127,26 @@ pub fn fx_content(
         seg.append(&b);
     }
     oct.append(&seg);
+    // interval on top of the octave: 4th, 5th, …
+    let interval_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    interval_row.append(&gtk::Label::builder().label("Interval").xalign(0.0).hexpand(true).build());
+    let semis: Vec<i32> = (-11..=11).collect();
+    let labels: Vec<String> =
+        semis
+            .iter()
+            .map(|&s| {
+                if s == 0 { "None".to_string() } else { format!("{} ({s:+})", crate::audio::effects::interval_name(s)) }
+            })
+            .collect();
+    let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+    let interval = gtk::DropDown::from_strings(&label_refs);
+    interval.set_selected(semis.iter().position(|&s| s == initial.semitones).unwrap_or(11) as u32);
+    {
+        let f = edit!(move |fx: &mut TrackFx, i: u32| fx.semitones = i as i32 - 11);
+        interval.connect_selected_notify(move |d| f(d.selected()));
+    }
+    interval_row.append(&interval);
+    oct.append(&interval_row);
     oct.append(&slider(
         "Blend",
         0.0,

@@ -92,3 +92,89 @@ pub fn noise(len: usize, amp: f32, seed: u32) -> Vec<f32> {
         })
         .collect()
 }
+
+/// Filter-curve points per loop repetition (song mode automation).
+pub const FILTER_RES: usize = 16;
+
+/// Value of a filter curve (−1 … 1, see [`TrackFilter`]) at song position `pos`.
+pub fn filter_at(curve: &[f32], pos: u64, loop_len: usize) -> f32 {
+    if curve.is_empty() || loop_len == 0 {
+        return 0.0;
+    }
+    let x = pos as f64 / loop_len as f64 * FILTER_RES as f64;
+    let i = x.floor() as usize;
+    let f = (x - i as f64) as f32;
+    let a = curve.get(i).copied().unwrap_or(0.0);
+    let b = curve.get(i + 1).copied().unwrap_or(a);
+    a + (b - a) * f
+}
+
+/// One track's sweepable filter: below 0 a low-pass (less treble, −1 ≈ 150 Hz), above 0 a
+/// high-pass (less bass, +1 ≈ 3 kHz), 0 = open. A TPT state-variable filter, so the cutoff can
+/// move every block without clicks.
+#[derive(Default, Clone)]
+pub struct TrackFilter {
+    ic1: f32,
+    ic2: f32,
+    smoothed: f32,
+}
+
+impl TrackFilter {
+    /// Process a block with the curve value `target` (smoothed, so drawn steps don't click).
+    pub fn process(&mut self, x: &mut [f32], target: f32, sr: f32) {
+        // ~10 ms glide towards the target per block
+        let k_glide = 1.0 - (-(x.len() as f32) / (0.01 * sr)).exp();
+        self.smoothed += (target.clamp(-1.0, 1.0) - self.smoothed) * k_glide;
+        let v = self.smoothed;
+        if v.abs() < 0.002 {
+            // open: pass through, keep the state decaying towards the signal
+            for s in x.iter() {
+                self.ic1 *= 0.99;
+                self.ic2 = *s;
+            }
+            return;
+        }
+        let fc = if v < 0.0 { 20_000.0 * (150.0f32 / 20_000.0).powf(-v) } else { 30.0 * (3000.0f32 / 30.0).powf(v) };
+        let g = (std::f32::consts::PI * fc.min(0.45 * sr) / sr).tan();
+        let k = std::f32::consts::SQRT_2; // Butterworth-ish Q
+        let a1 = 1.0 / (1.0 + g * (g + k));
+        let a2 = g * a1;
+        let a3 = g * a2;
+        for s in x.iter_mut() {
+            let v3 = *s - self.ic2;
+            let v1 = a1 * self.ic1 + a2 * v3;
+            let v2 = self.ic2 + a2 * self.ic1 + a3 * v3;
+            self.ic1 = 2.0 * v1 - self.ic1;
+            self.ic2 = 2.0 * v2 - self.ic2;
+            *s = if v < 0.0 { v2 } else { *s - k * v1 - v2 };
+        }
+    }
+}
+
+#[cfg(test)]
+mod filter_tests {
+    use super::*;
+
+    #[test]
+    fn closing_the_filter_removes_treble() {
+        let sr = 48000.0;
+        let hi = sine(6000.0, sr, 48000, 0.5);
+        let lo = sine(100.0, sr, 48000, 0.5);
+        let run = |x: &[f32], v: f32| {
+            let mut f = TrackFilter::default();
+            let mut y = x.to_vec();
+            for c in y.chunks_mut(256) {
+                f.process(c, v, sr);
+            }
+            rms(&y[24000..])
+        };
+        assert!(run(&hi, 0.0) > 0.3, "open filter keeps treble");
+        assert!(run(&hi, -0.6) < 0.05, "closed low-pass removes treble");
+        assert!(run(&lo, -0.6) > 0.3, "…but keeps the bass");
+        assert!(run(&lo, 0.7) < 0.05, "high-pass removes bass");
+        // curve lookup interpolates between points
+        let curve = [0.0, -1.0];
+        assert_eq!(filter_at(&curve, 0, 1600), 0.0);
+        assert!((filter_at(&curve, 50, 1600) + 0.5).abs() < 1e-6);
+    }
+}

@@ -240,7 +240,7 @@ impl App {
             let map = self.track_map(t);
             // the hit was played over the processed sound: map it back to the pattern's time
             let Some(idx) = track_index(pos, l, t.processed.len(), map.as_deref()) else { return };
-            let idx = t.fx.source_index(idx, t.raw.len());
+            let idx = self.raw_index(t, idx);
             let snap = self.cfg.borrow().drum_snap_div;
             t.drum_hits.push(Hit { pos: idx as u64, drum, snap });
         }
@@ -250,20 +250,26 @@ impl App {
 
     /// Re-synthesize a drum track from its pattern (instantly audible on the next pass).
     pub fn rerender_drums(self: &Rc<Self>, id: u32) {
-        let beat = self.drum_beat();
+        let cur = self.loop_len();
         {
             let mut tracks = self.tracks.borrow_mut();
             let Some(t) = tracks.iter_mut().find(|t| t.id == id) else { return };
+            let beat = self.drum_beat_for(t);
             let buf = Arc::new(drums::render(&t.drum_hits, t.raw.len(), &self.kit, beat));
             t.raw = buf.clone();
-            if t.fx.is_neutral() {
+            if t.fx.is_neutral() && self.track_loop_len(t) == cur {
                 t.processed = buf.clone();
                 *t.row.wave.peaks.borrow_mut() = super::widgets::compute_peaks(&buf, 1200);
                 t.row.area.queue_draw();
                 self.send(Command::ReplaceBuffer { id, buf });
             }
         }
-        let needs_fx = self.tracks.borrow().iter().find(|t| t.id == id).is_some_and(|t| !t.fx.is_neutral());
+        let needs_fx = self
+            .tracks
+            .borrow()
+            .iter()
+            .find(|t| t.id == id)
+            .is_some_and(|t| !t.fx.is_neutral() || self.track_loop_len(t) != cur);
         if needs_fx {
             self.reprocess(id);
         }
@@ -427,15 +433,16 @@ const GRID_LABEL_W: f64 = 52.0;
 
 /// Steps of the grid for the drum layer being edited: (track id, raw length, step length).
 /// Steps are 1/16 notes, coarser for very long layers (at most 64 columns).
-fn grid_layout(app: &App) -> Option<(u32, usize, f64)> {
+fn grid_layout(app: &App) -> Option<(u32, usize, f64, f64)> {
     let id = app.drum_rec.borrow().as_ref()?.track_id;
-    let len = app.tracks.borrow().iter().find(|t| t.id == id)?.raw.len();
-    let beat = app.drum_beat();
+    let tracks = app.tracks.borrow();
+    let t = tracks.iter().find(|t| t.id == id)?;
+    let (len, beat) = (t.raw.len(), app.drum_beat_for(t));
     let mut step = beat / 4.0;
     while len as f64 / step > 64.5 {
         step *= 2.0;
     }
-    Some((id, len, step))
+    Some((id, len, step, beat))
 }
 
 fn step_count(len: usize, step: f64) -> usize {
@@ -454,9 +461,8 @@ fn hit_cell(h: &Hit, beat: f64, len: usize, step: f64, steps: usize) -> usize {
 impl App {
     /// Click on the step grid: remove the drum's hits in that cell, or add one on the step.
     pub fn toggle_drum_step(self: &Rc<Self>, drum: u8, cell: usize) {
-        let Some((id, len, step)) = grid_layout(self) else { return };
+        let Some((id, len, step, beat)) = grid_layout(self) else { return };
         let steps = step_count(len, step);
-        let beat = self.drum_beat();
         {
             let mut tracks = self.tracks.borrow_mut();
             let Some(t) = tracks.iter_mut().find(|t| t.id == id) else { return };
@@ -489,7 +495,7 @@ fn step_grid(app: &Rc<App>) -> gtk::DrawingArea {
         let app = app.clone();
         let a = area.clone();
         click.connect_pressed(move |_, _, x, y| {
-            let Some((_, len, step)) = grid_layout(&app) else { return };
+            let Some((_, len, step, _)) = grid_layout(&app) else { return };
             let steps = step_count(len, step);
             let w = a.width() as f64 - GRID_LABEL_W;
             if x < GRID_LABEL_W || w <= 0.0 {
@@ -507,9 +513,8 @@ fn step_grid(app: &Rc<App>) -> gtk::DrawingArea {
 }
 
 fn draw_step_grid(app: &App, a: &gtk::DrawingArea, cr: &gtk::cairo::Context, w: f64) {
-    let Some((id, len, step)) = grid_layout(app) else { return };
+    let Some((id, len, step, beat)) = grid_layout(app) else { return };
     let steps = step_count(len, step);
-    let beat = app.drum_beat();
     let fg = a.color();
     let (fr, fgc, fb) = (fg.red() as f64, fg.green() as f64, fg.blue() as f64);
     let cw = (w - GRID_LABEL_W) / steps as f64;
@@ -550,7 +555,7 @@ fn draw_step_grid(app: &App, a: &gtk::DrawingArea, cr: &gtk::cairo::Context, w: 
     if st.playing && st.loop_len > 0 {
         let map = app.track_map(t);
         if let Some(i) = track_index(st.pos, st.loop_len, t.processed.len(), map.as_deref()) {
-            let raw = t.fx.source_index(i, len);
+            let raw = app.raw_index(t, i);
             let x = GRID_LABEL_W + raw as f64 / len as f64 * (w - GRID_LABEL_W);
             cr.set_source_rgba(0.88, 0.11, 0.14, 0.9);
             cr.rectangle(x.round() - 1.0, 0.0, 2.0, GRID_ROW_H * drums::DRUM_COUNT as f64);
