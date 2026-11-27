@@ -208,7 +208,16 @@ pub fn build(app: &Rc<App>, gtk_app: &adw::Application) {
     {
         let rev = drum.card.clone();
         let app2 = app.clone();
+        // hide the revealer once it is closed: side by side, a closed one would still take its width
+        rev.connect_child_revealed_notify(|r| {
+            if !r.is_child_revealed() {
+                r.set_visible(false);
+            }
+        });
         drums_toggle.connect_toggled(move |b| {
+            if b.is_active() {
+                rev.set_visible(true);
+            }
             rev.set_reveal_child(b.is_active());
             if !b.is_active() {
                 app2.finish_drums();
@@ -322,8 +331,13 @@ pub fn build(app: &Rc<App>, gtk_app: &adw::Application) {
     content.set_margin_bottom(24);
     content.set_margin_start(12);
     content.set_margin_end(12);
-    content.append(&hero);
-    content.append(&drum.card);
+    // hero + drum machine: stacked normally, side by side in a wide window
+    let top_row = gtk::Box::new(gtk::Orientation::Vertical, 18);
+    hero.set_hexpand(true);
+    drum.card.set_hexpand(true);
+    top_row.append(&hero);
+    top_row.append(&drum.card);
+    content.append(&top_row);
     content.append(&timeline_card);
     content.append(&stack);
 
@@ -347,6 +361,21 @@ pub fn build(app: &Rc<App>, gtk_app: &adw::Application) {
         .height_request(480)
         .content(&view)
         .build();
+
+    // wide windows: use the space – larger content width, hero and drums side by side,
+    // a taller timeline (see `song::wave_h`)
+    let wide = adw::Breakpoint::new(adw::BreakpointCondition::parse("min-width: 1200sp").expect("breakpoint"));
+    wide.add_setter(&clamp, "maximum-size", Some(&2000i32.to_value()));
+    wide.add_setter(&top_row, "orientation", Some(&gtk::Orientation::Horizontal.to_value()));
+    {
+        let app = app.clone();
+        wide.connect_apply(move |_| app.set_wide(true));
+    }
+    {
+        let app = app.clone();
+        wide.connect_unapply(move |_| app.set_wide(false));
+    }
+    window.add_breakpoint(wide);
 
     install_keys(app, &window);
 
@@ -395,6 +424,7 @@ pub fn build(app: &Rc<App>, gtk_app: &adw::Application) {
         drum_status: drum.status,
         drum_bars: drum.bars,
         drum_bars_box: drum.bars_box,
+        drum_grid: drum.grid,
     };
     let _ = app.ui.set(ui);
     app.refresh_drum_panel();
@@ -584,6 +614,8 @@ fn install_keys(app: &Rc<App>, window: &adw::ApplicationWindow) {
                 gdk::Key::a | gdk::Key::j => Some(0),
                 gdk::Key::s | gdk::Key::k => Some(1),
                 gdk::Key::d | gdk::Key::l => Some(2),
+                gdk::Key::f | gdk::Key::odiaeresis | gdk::Key::semicolon => Some(3),
+                gdk::Key::g | gdk::Key::adiaeresis | gdk::Key::apostrophe => Some(4),
                 _ => None,
             };
             if let Some(d) = drum {

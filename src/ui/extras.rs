@@ -16,7 +16,8 @@ pub struct DrumRec {
     pub track_id: u32,
 }
 
-pub const DRUM_KEYS: [[&str; 2]; 3] = [["A", "J"], ["S", "K"], ["D", "L"]];
+/// Keyboard keys per drum: left hand / right hand (Ö and Ä are ; and ' on US layouts).
+pub const DRUM_KEYS: [[&str; 2]; drums::DRUM_COUNT] = [["A", "J"], ["S", "K"], ["D", "L"], ["F", "Ö"], ["G", "Ä"]];
 
 impl App {
     // ------------------------------------------------------------ import
@@ -296,6 +297,8 @@ impl App {
         let rec = self.drum_rec.borrow();
         let has_loop = self.loop_len() > 0;
         ui.drum_bars_box.set_visible(!has_loop && rec.is_none());
+        ui.drum_grid.set_visible(rec.is_some());
+        ui.drum_grid.queue_draw();
         match &*rec {
             Some(r) => {
                 let hits =
@@ -304,7 +307,7 @@ impl App {
                 ui.drum_record.add_css_class("destructive-action");
                 ui.drum_record.remove_css_class("suggested-action");
                 ui.drum_status.set_label(&format!(
-                    "Recording · {hits} hit{} — keep playing, every pass adds to the pattern. Space = done, Ctrl+Z = remove last hit",
+                    "Recording · {hits} hit{} — keep playing, every pass adds to the pattern, or click the grid. Space = done, Ctrl+Z = remove last hit",
                     if hits == 1 { "" } else { "s" }
                 ));
             }
@@ -312,14 +315,12 @@ impl App {
                 ui.drum_record.set_label("Record drum layer");
                 ui.drum_record.remove_css_class("destructive-action");
                 ui.drum_record.add_css_class("suggested-action");
+                let left: Vec<&str> = DRUM_KEYS.iter().map(|k| k[0]).collect();
+                let right: Vec<&str> = DRUM_KEYS.iter().map(|k| k[1]).collect();
                 ui.drum_status.set_label(&format!(
-                    "Play with {} / {} / {} (or {} {} {}). {}",
-                    DRUM_KEYS[0][0],
-                    DRUM_KEYS[1][0],
-                    DRUM_KEYS[2][0],
-                    DRUM_KEYS[0][1],
-                    DRUM_KEYS[1][1],
-                    DRUM_KEYS[2][1],
+                    "Play with {} (or {}). {}",
+                    left.join(" "),
+                    right.join(" "),
                     if has_loop {
                         "Recording loops over the layer length."
                     } else {
@@ -339,6 +340,7 @@ pub struct DrumPanel {
     pub status: gtk::Label,
     pub bars: gtk::DropDown,
     pub bars_box: gtk::Box,
+    pub grid: gtk::DrawingArea,
 }
 
 pub fn drum_panel(app: &Rc<App>) -> DrumPanel {
@@ -401,6 +403,8 @@ pub fn drum_panel(app: &Rc<App>) -> DrumPanel {
         pads.push(pad);
     }
     card.append(&pads_box);
+    let grid = step_grid(app);
+    card.append(&grid);
     let status = gtk::Label::builder().xalign(0.0).wrap(true).css_classes(["caption", "dim-label"]).build();
     card.append(&status);
 
@@ -408,6 +412,149 @@ pub fn drum_panel(app: &Rc<App>) -> DrumPanel {
         .child(&card)
         .transition_type(gtk::RevealerTransitionType::SlideDown)
         .reveal_child(false)
+        .visible(false)
         .build();
-    DrumPanel { card: revealer, pads, record, status, bars, bars_box }
+    DrumPanel { card: revealer, pads, record, status, bars, bars_box, grid }
+}
+
+// ---------------------------------------------------------------- step grid
+
+/// Pad colours (match the CSS of the pads).
+const DRUM_COLOURS: [(f64, f64, f64); drums::DRUM_COUNT] =
+    [(0.88, 0.11, 0.14), (0.21, 0.52, 0.89), (0.90, 0.65, 0.04), (0.57, 0.25, 0.67), (0.15, 0.64, 0.41)];
+const GRID_ROW_H: f64 = 18.0;
+const GRID_LABEL_W: f64 = 52.0;
+
+/// Steps of the grid for the drum layer being edited: (track id, raw length, step length).
+/// Steps are 1/16 notes, coarser for very long layers (at most 64 columns).
+fn grid_layout(app: &App) -> Option<(u32, usize, f64)> {
+    let id = app.drum_rec.borrow().as_ref()?.track_id;
+    let len = app.tracks.borrow().iter().find(|t| t.id == id)?.raw.len();
+    let beat = app.drum_beat();
+    let mut step = beat / 4.0;
+    while len as f64 / step > 64.5 {
+        step *= 2.0;
+    }
+    Some((id, len, step))
+}
+
+fn step_count(len: usize, step: f64) -> usize {
+    ((len as f64 / step).round() as usize).max(1)
+}
+
+/// Cell a hit sounds in (after its own snap).
+fn hit_cell(h: &Hit, beat: f64, len: usize, step: f64, steps: usize) -> usize {
+    let pos = match drums::grid_len(h.snap, beat) {
+        Some(g) => drums::quantize(h.pos, g, len),
+        None => h.pos % len.max(1) as u64,
+    };
+    (pos as f64 / step).round() as usize % steps
+}
+
+impl App {
+    /// Click on the step grid: remove the drum's hits in that cell, or add one on the step.
+    pub fn toggle_drum_step(self: &Rc<Self>, drum: u8, cell: usize) {
+        let Some((id, len, step)) = grid_layout(self) else { return };
+        let steps = step_count(len, step);
+        let beat = self.drum_beat();
+        {
+            let mut tracks = self.tracks.borrow_mut();
+            let Some(t) = tracks.iter_mut().find(|t| t.id == id) else { return };
+            let before = t.drum_hits.len();
+            t.drum_hits.retain(|h| h.drum != drum || hit_cell(h, beat, len, step, steps) != cell);
+            if t.drum_hits.len() == before {
+                // placed exactly on the step, so no snap needed
+                let pos = ((cell as f64 * step).round() as u64).min(len.saturating_sub(1) as u64);
+                t.drum_hits.push(Hit { pos, drum, snap: 0 });
+            }
+        }
+        self.mark_dirty();
+        self.rerender_drums(id);
+    }
+}
+
+fn step_grid(app: &Rc<App>) -> gtk::DrawingArea {
+    let area = gtk::DrawingArea::builder()
+        .hexpand(true)
+        .content_height((GRID_ROW_H * drums::DRUM_COUNT as f64 + 2.0) as i32)
+        .visible(false)
+        .build();
+    area.set_cursor_from_name(Some("pointer"));
+    {
+        let app = app.clone();
+        area.set_draw_func(move |a, cr, w, _| draw_step_grid(&app, a, cr, w as f64));
+    }
+    let click = gtk::GestureClick::new();
+    {
+        let app = app.clone();
+        let a = area.clone();
+        click.connect_pressed(move |_, _, x, y| {
+            let Some((_, len, step)) = grid_layout(&app) else { return };
+            let steps = step_count(len, step);
+            let w = a.width() as f64 - GRID_LABEL_W;
+            if x < GRID_LABEL_W || w <= 0.0 {
+                return;
+            }
+            let cell = (((x - GRID_LABEL_W) / w) * steps as f64).floor() as usize;
+            let drum = (y / GRID_ROW_H).floor() as usize;
+            if drum < drums::DRUM_COUNT && cell < steps {
+                app.toggle_drum_step(drum as u8, cell);
+            }
+        });
+    }
+    area.add_controller(click);
+    area
+}
+
+fn draw_step_grid(app: &App, a: &gtk::DrawingArea, cr: &gtk::cairo::Context, w: f64) {
+    let Some((id, len, step)) = grid_layout(app) else { return };
+    let steps = step_count(len, step);
+    let beat = app.drum_beat();
+    let fg = a.color();
+    let (fr, fgc, fb) = (fg.red() as f64, fg.green() as f64, fg.blue() as f64);
+    let cw = (w - GRID_LABEL_W) / steps as f64;
+    let steps_per_beat = (beat / step).round().max(1.0) as usize;
+
+    let tracks = app.tracks.borrow();
+    let Some(t) = tracks.iter().find(|t| t.id == id) else { return };
+    let mut on = vec![vec![false; steps]; drums::DRUM_COUNT];
+    for h in &t.drum_hits {
+        if let Some(row) = on.get_mut(h.drum as usize) {
+            row[hit_cell(h, beat, len, step, steps)] = true;
+        }
+    }
+
+    cr.set_font_size(10.0);
+    for (d, row) in on.iter().enumerate() {
+        let y = d as f64 * GRID_ROW_H;
+        cr.set_source_rgba(fr, fgc, fb, 0.6);
+        cr.move_to(0.0, y + GRID_ROW_H - 5.0);
+        let _ = cr.show_text(DRUM_NAMES[d]);
+        let (r, g, b) = DRUM_COLOURS[d];
+        for (c, &hit) in row.iter().enumerate() {
+            let x = GRID_LABEL_W + c as f64 * cw;
+            // beats are a bit brighter, so the pattern is easy to read
+            let base = if (c / steps_per_beat).is_multiple_of(2) { 0.10 } else { 0.06 };
+            if hit {
+                cr.set_source_rgba(r, g, b, 0.9);
+            } else {
+                cr.set_source_rgba(fr, fgc, fb, base);
+            }
+            cr.rectangle(x + 1.0, y + 1.0, (cw - 2.0).max(1.0), GRID_ROW_H - 2.0);
+            let _ = cr.fill();
+        }
+    }
+
+    // playhead (what you hear, mapped back through the track's speed / reverse)
+    let st = app.status.borrow();
+    if st.playing && st.loop_len > 0 {
+        let map = app.track_map(t);
+        if let Some(i) = track_index(st.pos, st.loop_len, t.processed.len(), map.as_deref()) {
+            let raw = t.fx.source_index(i, len);
+            let x = GRID_LABEL_W + raw as f64 / len as f64 * (w - GRID_LABEL_W);
+            cr.set_source_rgba(0.88, 0.11, 0.14, 0.9);
+            cr.rectangle(x.round() - 1.0, 0.0, 2.0, GRID_ROW_H * drums::DRUM_COUNT as f64);
+            let _ = cr.fill();
+        }
+    }
 }

@@ -19,7 +19,12 @@ thread_local! {
 }
 
 fn main() -> glib::ExitCode {
-    let app = adw::Application::builder().application_id(APP_ID).flags(gio::ApplicationFlags::HANDLES_OPEN).build();
+    let mut flags = gio::ApplicationFlags::HANDLES_OPEN;
+    // dev hooks (demo, snapshot, …) run as a separate instance next to a normally running app
+    if std::env::vars_os().any(|(k, _)| k.to_string_lossy().starts_with("SYNTH_STRING_")) {
+        flags |= gio::ApplicationFlags::NON_UNIQUE;
+    }
+    let app = adw::Application::builder().application_id(APP_ID).flags(flags).build();
     // `synth-string song.synthstring` (or double-click in the file manager) opens a project
     app.connect_open(|gtk_app, files, _| {
         gtk_app.activate();
@@ -190,6 +195,12 @@ fn install_actions(app: &Rc<ui::app::App>, gtk_app: &adw::Application) {
 /// Developer hooks: `SYNTH_STRING_DEMO=1` injects synthetic tracks, `SYNTH_STRING_SNAPSHOT=file.png`
 /// renders the window to a PNG after a few seconds (useful for headless UI checks).
 fn debug_hooks(app: &Rc<ui::app::App>) {
+    if let Some(size) = std::env::var("SYNTH_STRING_SIZE").ok().and_then(|s| {
+        let (w, h) = s.split_once('x')?;
+        Some((w.parse::<i32>().ok()?, h.parse::<i32>().ok()?))
+    }) {
+        app.ui().window.set_default_size(size.0, size.1);
+    }
     if std::env::var_os("SYNTH_STRING_SWITCH").is_some() {
         // cycle the input selection through the device popover combo, like a user would
         for k in 0..8u64 {
@@ -245,6 +256,9 @@ fn debug_hooks(app: &Rc<ui::app::App>) {
                         app.toggle_clip_at(2, rep);
                     }
                 }
+                // the first track fades out over the last 4 repetitions
+                let id = app.tracks.borrow()[0].id;
+                app.set_fx(id, crate::audio::effects::TrackFx { fade_out: 4, ..Default::default() });
                 app.seek_fraction(0.21);
             });
         }

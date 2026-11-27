@@ -5,7 +5,11 @@ use serde::{Deserialize, Serialize};
 use std::f32::consts::PI;
 use std::sync::Arc;
 
-pub const DRUM_NAMES: [&str; 3] = ["Kick", "Snare", "Hi-hat"];
+pub const DRUM_COUNT: usize = 5;
+pub const DRUM_NAMES: [&str; DRUM_COUNT] = ["Kick", "Snare", "Hi-hat", "Clap", "Tom"];
+
+/// The synthesized one-shots, indexed like [`DRUM_NAMES`].
+pub type Kit = [Vec<f32>; DRUM_COUNT];
 
 /// Snap choices: note value 1/N (0 = off).
 pub const SNAP_DIVS: [u8; 5] = [0, 2, 4, 8, 16];
@@ -89,10 +93,51 @@ fn hihat(sr: f32) -> Vec<f32> {
         .collect()
 }
 
-/// The three drum one-shots at the engine rate.
-pub fn kit() -> Arc<[Vec<f32>; 3]> {
+/// Hand clap: a few quick noise bursts (several hands) and a short band-passed tail.
+fn clap(sr: f32) -> Vec<f32> {
+    let n = (0.22 * sr) as usize;
+    let mut seed = 31;
+    // band-pass around ~1.2 kHz: high-pass then low-pass
+    let a_hp = 1.0 - (-2.0 * PI * 700.0 / sr).exp();
+    let a_lp = 1.0 - (-2.0 * PI * 2400.0 / sr).exp();
+    let (mut lp1, mut lp2) = (0.0, 0.0);
+    let bursts = [0.0f32, 0.011, 0.022];
+    (0..n)
+        .map(|i| {
+            let t = i as f32 / sr;
+            let nz = noise(&mut seed);
+            lp1 += a_hp * (nz - lp1);
+            let hp = nz - lp1;
+            lp2 += a_lp * (hp - lp2);
+            let env_bursts: f32 =
+                bursts.iter().filter(|&&b| t >= b).map(|&b| (-(t - b) * 180.0).exp()).fold(0.0, f32::max);
+            let tail = if t >= 0.03 { (-(t - 0.03) * 22.0).exp() * 0.6 } else { 0.0 };
+            lp2 * env_bursts.max(tail) * 1.6
+        })
+        .collect()
+}
+
+/// Floor tom: a pitched body sliding down, with a little stick noise.
+fn tom(sr: f32) -> Vec<f32> {
+    let n = (0.5 * sr) as usize;
+    let mut phase = 0.0f32;
+    let mut seed = 5;
+    (0..n)
+        .map(|i| {
+            let t = i as f32 / sr;
+            let f = 105.0 + 70.0 * (-t * 14.0).exp();
+            phase += 2.0 * PI * f / sr;
+            let body = (phase.sin() + 0.25 * (2.0 * phase).sin()) * (-t * 6.5).exp();
+            let stick = if t < 0.004 { noise(&mut seed) * (1.0 - t / 0.004) * 0.3 } else { 0.0 };
+            (body + stick) * 0.7
+        })
+        .collect()
+}
+
+/// All drum one-shots at the engine rate.
+pub fn kit() -> Arc<Kit> {
     let sr = SR as f32;
-    Arc::new([kick(sr), snare(sr), hihat(sr)])
+    Arc::new([kick(sr), snare(sr), hihat(sr), clap(sr), tom(sr)])
 }
 
 /// Snap a position to a grid of `grid` samples (wrapping inside `len`).
@@ -105,7 +150,7 @@ pub fn quantize(pos: u64, grid: f64, len: usize) -> u64 {
 
 /// Render a pattern into a loop buffer of `len` samples (sounds wrap around the seam).
 /// `beat` is the length of one beat in samples (used for each hit's snap).
-pub fn render(hits: &[Hit], len: usize, kit: &[Vec<f32>; 3], beat: f64) -> Vec<f32> {
+pub fn render(hits: &[Hit], len: usize, kit: &Kit, beat: f64) -> Vec<f32> {
     let mut out = vec![0f32; len];
     if len == 0 {
         return out;

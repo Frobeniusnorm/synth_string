@@ -253,6 +253,27 @@ pub fn fx_content(
         vec![],
     ));
 
+    // ---- Fade in / out (a volume curve over repetitions, no re-render)
+    let (fade, _) = section(
+        "Fade",
+        "Song mode: over the first / last repetitions of each stretch the track plays in. Loop mode: in the export",
+    );
+    const FADE_REPS: [u32; 5] = [0, 1, 2, 4, 8];
+    let fade_row = |label: &str, initial: u32, set: fn(&mut TrackFx, u32)| {
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        row.append(&gtk::Label::builder().label(label).xalign(0.0).hexpand(true).build());
+        let dd =
+            gtk::DropDown::from_strings(&["Off", "1 repetition", "2 repetitions", "4 repetitions", "8 repetitions"]);
+        dd.set_selected(FADE_REPS.iter().position(|r| *r == initial).unwrap_or(0) as u32);
+        let f = edit!(move |fx: &mut TrackFx, i: u32| set(fx, FADE_REPS[(i as usize).min(FADE_REPS.len() - 1)]));
+        dd.connect_selected_notify(move |d| f(d.selected()));
+        row.append(&dd);
+        row
+    };
+    fade.append(&fade_row("Fade in", initial.fade_in, |fx, r| fx.fade_in = r));
+    fade.append(&fade_row("Fade out", initial.fade_out, |fx, r| fx.fade_out = r));
+    content.append(&fade);
+
     gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
         .propagate_natural_height(true)

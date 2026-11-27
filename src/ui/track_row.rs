@@ -26,7 +26,7 @@ impl TrackRow {
         self.mute.set_active(mute);
         self.solo.set_active(solo);
         self.fx_label.set_label(&fx_text(fx, self.wave.cycles.get()));
-        if !fx.is_neutral() {
+        if !fx.is_neutral() || fx.has_fade() {
             self.fx_button.add_css_class("fx-active");
         }
     }

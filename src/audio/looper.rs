@@ -66,6 +66,8 @@ pub enum Command {
     SetTrackMap {
         id: u32,
         map: Option<RepMap>,
+        /// Volume per repetition (fade in / out); `None` = full volume.
+        env: Option<Envelope>,
     },
     /// Song length in loop repetitions; 0 = automatic (just loop the tracks).
     SetSongReps(u32),
@@ -87,6 +89,18 @@ pub enum Command {
 }
 
 pub type RepMap = Arc<Vec<i32>>;
+/// Per loop repetition: volume at its start and at its end (linear in between).
+pub type Envelope = Arc<Vec<(f32, f32)>>;
+
+/// Volume of an envelope at song position `pos`.
+#[inline]
+pub fn env_gain(pos: u64, loop_len: usize, env: &[(f32, f32)]) -> f32 {
+    let l = loop_len.max(1) as u64;
+    match env.get((pos / l) as usize) {
+        Some(&(a, b)) => a + (b - a) * ((pos % l) as f32 / l as f32),
+        None => 1.0,
+    }
+}
 
 pub struct RestoreTrack {
     pub id: u32,
@@ -181,11 +195,12 @@ struct Track {
     mute: bool,
     solo: bool,
     map: Option<RepMap>,
+    env: Option<Envelope>,
 }
 
 impl Track {
     fn new(id: u32, buf: Buffer) -> Self {
-        Self { id, buf, gain: 1.0, mute: false, solo: false, map: None }
+        Self { id, buf, gain: 1.0, mute: false, solo: false, map: None, env: None }
     }
 }
 
@@ -265,7 +280,7 @@ pub struct Looper {
     preroll: usize,
     tail: usize,
 
-    kit: Arc<[Vec<f32>; 3]>,
+    kit: Arc<super::drums::Kit>,
     /// Active drum voices: (drum, sample index; negative = samples until it starts).
     voices: Vec<(u8, i64)>,
     pending_hits: Vec<(u8, u8)>,
@@ -427,9 +442,10 @@ impl Looper {
                     }
                     self.tracks.push(Track::new(id, buf));
                 }
-                Command::SetTrackMap { id, map } => {
+                Command::SetTrackMap { id, map, env } => {
                     if let Some(t) = self.tracks.iter_mut().find(|t| t.id == id) {
                         t.map = map;
+                        t.env = env;
                     }
                 }
                 Command::SetSongReps(r) => self.song_reps = r,
@@ -457,6 +473,7 @@ impl Looper {
                             mute: t.mute,
                             solo: t.solo,
                             map: t.map,
+                            env: None,
                         });
                     }
                     self.loop_len = loop_len;
@@ -731,7 +748,8 @@ impl Looper {
                     }
                     if let Some(i) = track_index(a, self.loop_len, t.buf.len(), t.map.as_deref().map(|v| v.as_slice()))
                     {
-                        s += t.buf[i] * t.gain;
+                        let fade = t.env.as_deref().map_or(1.0, |e| env_gain(a, self.loop_len, e));
+                        s += t.buf[i] * t.gain * fade;
                     }
                 }
                 self.abs = (self.abs + 1) % song_len;

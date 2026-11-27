@@ -122,8 +122,12 @@ button.drum-pad {
 button.drum-pad-0 { background: alpha(#e01b24, 0.18); }
 button.drum-pad-1 { background: alpha(#3584e4, 0.18); }
 button.drum-pad-2 { background: alpha(#f6d32d, 0.22); }
+button.drum-pad-3 { background: alpha(#c061cb, 0.20); }
+button.drum-pad-4 { background: alpha(#33d17a, 0.20); }
 
 button.drum-pad.hit { background: alpha(@accent_bg_color, 0.85); color: @accent_fg_color; }
 button.drum-pad-0.hit { background: #e01b24; color: white; }
 button.drum-pad-1.hit { background: #3584e4; color: white; }
 button.drum-pad-2.hit { background: #e5a50a; color: white; }
+button.drum-pad-3.hit { background: #9141ac; color: white; }
+button.drum-pad-4.hit { background: #26a269; color: white; }

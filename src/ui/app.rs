@@ -96,6 +96,7 @@ pub struct Ui {
     pub drum_status: gtk::Label,
     pub drum_bars: gtk::DropDown,
     pub drum_bars_box: gtk::Box,
+    pub drum_grid: gtk::DrawingArea,
 }
 
 /// MIDI learn in progress: the action being mapped and a callback once it is learned.
@@ -130,6 +131,8 @@ pub struct App {
     startup_noise_pending: Cell<bool>,
     ticks: Cell<u64>,
     pub song_mode: Cell<bool>,
+    /// Wide window (breakpoint): bigger timeline, hero and drum machine side by side.
+    pub wide: Cell<bool>,
     pub song_reps: Cell<u32>,
     pub project_path: RefCell<Option<std::path::PathBuf>>,
     pub dirty: Cell<bool>,
@@ -137,7 +140,7 @@ pub struct App {
     /// Name and kind for tracks injected by import / drum machine, keyed by id.
     pub pending_meta: RefCell<std::collections::HashMap<u32, (String, TrackKind)>>,
     pub drum_rec: RefCell<Option<super::extras::DrumRec>>,
-    pub kit: Arc<[Vec<f32>; 3]>,
+    pub kit: Arc<crate::audio::drums::Kit>,
 }
 
 /// Lengths offered for new layers, in loop repetitions.
@@ -182,6 +185,7 @@ impl App {
             startup_noise_pending: Cell::new(true),
             ticks: Cell::new(0),
             song_mode: Cell::new(false),
+            wide: Cell::new(false),
             song_reps: Cell::new(0),
             project_path: RefCell::new(None),
             dirty: Cell::new(false),
@@ -765,20 +769,26 @@ impl App {
     }
 
     pub fn set_fx(self: &Rc<Self>, id: u32, fx: TrackFx) {
-        {
+        let sound_changed = {
             let mut tracks = self.tracks.borrow_mut();
             let Some(t) = tracks.iter_mut().find(|t| t.id == id) else { return };
             let cycles = t.row.wave.cycles.get();
             t.row.fx_label.set_label(&track_row::fx_text(&fx, cycles));
-            if fx.is_neutral() {
+            if fx.is_neutral() && !fx.has_fade() {
                 t.row.fx_button.remove_css_class("fx-active");
             } else {
                 t.row.fx_button.add_css_class("fx-active");
             }
+            // fades are a volume curve: only the sound settings need a re-render
+            let sound_changed = t.fx.sound() != fx.sound();
             t.fx = fx;
-        }
+            sound_changed
+        };
         self.mark_dirty();
-        self.reprocess(id);
+        if sound_changed {
+            self.reprocess(id);
+        }
+        self.push_arrangement();
     }
 
     /// Re-render a track (noise reduction + effects) in the background, debounced.
@@ -1238,6 +1248,9 @@ impl App {
         }
         drop(tracks);
         ui.timeline.queue_draw();
+        if ui.drum_grid.is_visible() {
+            ui.drum_grid.queue_draw();
+        }
     }
 
     /// Synthetic plucked-string loops for demos and UI checks.
@@ -1368,6 +1381,8 @@ impl App {
                     gain: t.gain,
                     audible: !t.mute && (!any_solo || t.solo),
                     map: self.track_map(t),
+                    env: self.track_env(t),
+                    fade: (t.fx.fade_in, t.fx.fade_out),
                 })
                 .collect()
         };

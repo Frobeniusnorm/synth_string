@@ -1,6 +1,6 @@
 //! WAV export of the arranged song (mixdown) and individual stems.
 
-use crate::audio::looper::{SR, track_slot};
+use crate::audio::looper::{SR, env_gain, track_slot};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -11,6 +11,10 @@ pub struct ExportTrack {
     pub audible: bool,
     /// Arrangement map (see [`track_slot`]); `None` = loops everywhere.
     pub map: Option<Vec<i32>>,
+    /// Song-mode fade envelope per repetition (see `env_gain`).
+    pub env: Option<Vec<(f32, f32)>>,
+    /// Loop mode (no `map`): fade in / out over this many loops at the start / end of the export.
+    pub fade: (u32, u32),
 }
 
 pub struct Song {
@@ -46,12 +50,33 @@ fn wrap_tail(t: &ExportTrack, loop_len: usize) -> usize {
 fn render(t: &ExportTrack, song: &Song, total: usize) -> Vec<f32> {
     let passes = song.repeats.max(1) as usize;
     let song_len = song.song_len.max(1);
+    let main = song_len * passes; // without the wrap tail
+    let lf = song.loop_len.max(1) as f32;
+    // loop mode: fade over the whole export
+    let loop_fade = |i: usize| {
+        let (fin, fout) = t.fade;
+        let mut g = 1.0f32;
+        if fin > 0 {
+            g *= (i as f32 / (fin as f32 * lf)).min(1.0);
+        }
+        if fout > 0 {
+            g *= (main.saturating_sub(i) as f32 / (fout as f32 * lf)).min(1.0);
+        }
+        g
+    };
     (0..total)
         .map(|i| {
             let pass = i / song_len;
             let pos = (i % song_len) as u64;
             match track_slot(pos, song.loop_len, t.buf.len(), t.map.as_deref()) {
-                Some((k, wrapped)) if (wrapped && pass >= 1) || (!wrapped && pass < passes) => t.buf[k] * t.gain,
+                Some((k, wrapped)) if (wrapped && pass >= 1) || (!wrapped && pass < passes) => {
+                    let fade = match (&t.env, &t.map) {
+                        (Some(e), _) => env_gain(pos, song.loop_len, e),
+                        (None, None) => loop_fade(i),
+                        _ => 1.0,
+                    };
+                    t.buf[k] * t.gain * fade
+                }
                 _ => 0.0,
             }
         })
@@ -116,6 +141,8 @@ mod tests {
                 gain: 1.0,
                 audible: true,
                 map: None,
+                env: None,
+                fade: (0, 0),
             },
             // a "solo" only in repetition 2
             ExportTrack {
@@ -124,6 +151,8 @@ mod tests {
                 gain: 1.0,
                 audible: true,
                 map: Some(vec![-1, 1, -1]),
+                env: None,
+                fade: (0, 0),
             },
         ];
         let song = Song { loop_len: 4000, song_len: 12000, repeats: 1 };
@@ -150,6 +179,8 @@ mod tests {
             gain: 1.0,
             audible: true,
             map: Some(vec![2, -1, 2]),
+            env: None,
+            fade: (0, 0),
         };
         let song = Song { loop_len: 1000, song_len: 3000, repeats: 2 };
         assert_eq!(wrap_tail(&t, 1000), 1000);
@@ -159,5 +190,25 @@ mod tests {
         assert_eq!(y[3500], 1500.0, "second pass starts with the tail of the first");
         assert_eq!(y[5500], 500.0);
         assert_eq!(y[6500], 1500.0, "after the last pass the clip finishes");
+    }
+
+    #[test]
+    fn loop_mode_export_fades() {
+        let t = ExportTrack {
+            name: "Pad".into(),
+            buf: Arc::new(vec![1.0; 1000]),
+            gain: 1.0,
+            audible: true,
+            map: None,
+            env: None,
+            fade: (1, 2),
+        };
+        let song = Song { loop_len: 1000, song_len: 1000, repeats: 4 };
+        let y = render(&t, &song, 4000);
+        assert_eq!(y[0], 0.0);
+        assert!((y[500] - 0.5).abs() < 1e-3, "fading in");
+        assert_eq!(y[1500], 1.0);
+        assert!((y[3000] - 0.5).abs() < 1e-3, "fading out over the last 2 loops");
+        assert!(y[3999] < 0.01);
     }
 }

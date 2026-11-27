@@ -27,6 +27,11 @@ pub struct TrackFx {
     pub reverb_size: f32,
     pub reverb_mix: f32,
     pub reverse: bool,
+    /// Fade in over this many repetitions at the start of each stretch the track plays in
+    /// (song mode) or of the export (loop mode); 0 = off. A volume curve, not rendered.
+    pub fade_in: u32,
+    /// Fade out over this many repetitions at the end (see `fade_in`); 0 = off.
+    pub fade_out: u32,
 }
 
 impl Default for TrackFx {
@@ -46,6 +51,8 @@ impl Default for TrackFx {
             reverb_size: 0.6,
             reverb_mix: 0.3,
             reverse: false,
+            fade_in: 0,
+            fade_out: 0,
         }
     }
 }
@@ -73,6 +80,16 @@ impl TrackFx {
         if self.reverse { raw_len - 1 - i } else { i }
     }
 
+    /// The same settings without the fades (which don't change the rendered sound).
+    pub fn sound(&self) -> TrackFx {
+        TrackFx { fade_in: 0, fade_out: 0, ..self.clone() }
+    }
+
+    pub fn has_fade(&self) -> bool {
+        self.fade_in > 0 || self.fade_out > 0
+    }
+
+    /// No effect changes the sound (fades are a volume curve and don't count).
     pub fn is_neutral(&self) -> bool {
         (self.octave == 0 || self.octave_blend <= 0.0)
             && self.speed_up() == 1
@@ -109,6 +126,12 @@ impl TrackFx {
         }
         if self.echo {
             parts.push("Echo".into());
+        }
+        if self.fade_in > 0 {
+            parts.push("Fade in".into());
+        }
+        if self.fade_out > 0 {
+            parts.push("Fade out".into());
         }
         if self.reverb {
             parts.push("Reverb".into());

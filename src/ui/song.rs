@@ -15,8 +15,16 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 pub const RULER_H: f64 = 18.0;
-pub const WAVE_H: f64 = 56.0;
-pub const LANE_H: f64 = 22.0;
+
+/// Height of the summed waveform (taller in a wide window).
+fn wave_h(app: &App) -> f64 {
+    if app.wide.get() { 132.0 } else { 56.0 }
+}
+
+/// Height of one track lane in song mode.
+fn lane_h(app: &App) -> f64 {
+    if app.wide.get() { 30.0 } else { 22.0 }
+}
 pub const LANE_GAP: f64 = 4.0;
 
 /// Per repetition: the repetition at which the covering clip starts, or −1.
@@ -94,6 +102,43 @@ pub fn linearize_take(raw: &[f32], start: usize, off: usize, l: usize) -> Vec<f3
     out
 }
 
+/// Volume envelope for fades: per repetition (gain at its start, gain at its end). The track
+/// plays in stretches of consecutive repetitions; each stretch fades in over its first
+/// `fade_in` and out over its last `fade_out` repetitions. `None` when there is no fade.
+pub fn fade_envelope(map: &[i32], fade_in: u32, fade_out: u32) -> Option<Vec<(f32, f32)>> {
+    if fade_in == 0 && fade_out == 0 {
+        return None;
+    }
+    let n = map.len();
+    let mut env = vec![(1.0f32, 1.0f32); n];
+    let mut r = 0;
+    while r < n {
+        if map[r] < 0 {
+            r += 1;
+            continue;
+        }
+        let a = r;
+        while r < n && map[r] >= 0 {
+            r += 1;
+        }
+        let b = r;
+        let gain = |x: usize| {
+            let mut g = 1.0f32;
+            if fade_in > 0 {
+                g *= ((x - a) as f32 / fade_in as f32).min(1.0);
+            }
+            if fade_out > 0 {
+                g *= ((b - x) as f32 / fade_out as f32).min(1.0);
+            }
+            g
+        };
+        for (k, e) in env.iter_mut().enumerate().take(b).skip(a) {
+            *e = (gain(k), gain(k + 1));
+        }
+    }
+    Some(env)
+}
+
 fn lcm_reps(tracks: &[TrackModel]) -> u32 {
     fn gcd(a: u32, b: u32) -> u32 {
         if b == 0 { a } else { gcd(b, a % b) }
@@ -122,10 +167,20 @@ impl App {
         self.song_mode.get().then(|| build_map(t.clips.as_deref(), t.cycles, self.song_reps.get().max(1)))
     }
 
+    /// Fade envelope of a track as the engine should use it (song mode only: a plain loop never ends).
+    pub fn track_env(&self, t: &TrackModel) -> Option<Vec<(f32, f32)>> {
+        let map = self.track_map(t)?;
+        fade_envelope(&map, t.fx.fade_in, t.fx.fade_out)
+    }
+
     pub fn push_arrangement(&self) {
         self.send(Command::SetSongReps(if self.song_mode.get() { self.song_reps.get().max(1) } else { 0 }));
         for t in self.tracks.borrow().iter() {
-            self.send(Command::SetTrackMap { id: t.id, map: self.track_map(t).map(Arc::new) });
+            self.send(Command::SetTrackMap {
+                id: t.id,
+                map: self.track_map(t).map(Arc::new),
+                env: self.track_env(t).map(Arc::new),
+            });
         }
         self.refresh_song_widgets();
     }
@@ -152,8 +207,15 @@ impl App {
             "Click the waveform to jump · turn on Song mode to arrange repetitions"
         });
         let lanes = if self.song_mode.get() { self.tracks.borrow().len() as f64 } else { 0.0 };
-        ui.timeline.set_content_height((RULER_H + WAVE_H + lanes * (LANE_H + LANE_GAP) + 4.0) as i32);
+        ui.timeline.set_content_height((RULER_H + wave_h(self) + lanes * (lane_h(self) + LANE_GAP) + 4.0) as i32);
         ui.timeline.queue_draw();
+    }
+
+    /// The window crossed the wide-layout breakpoint.
+    pub fn set_wide(&self, wide: bool) {
+        if self.wide.replace(wide) != wide {
+            self.refresh_song_widgets();
+        }
     }
 
     pub fn set_song_mode(&self, on: bool) {
@@ -532,7 +594,7 @@ fn project_filters() -> gio::ListStore {
 /// Global timeline: rep ruler, summed waveform of everything audible with a playhead (click or
 /// drag to jump), and in song mode one lane per track to place clips.
 pub fn timeline(app: &Rc<App>) -> gtk::DrawingArea {
-    let area = gtk::DrawingArea::builder().hexpand(true).content_height((RULER_H + WAVE_H + 4.0) as i32).build();
+    let area = gtk::DrawingArea::builder().hexpand(true).content_height((RULER_H + wave_h(app) + 4.0) as i32).build();
     area.set_cursor_from_name(Some("pointer"));
     {
         let app = app.clone();
@@ -549,7 +611,7 @@ pub fn timeline(app: &Rc<App>) -> gtk::DrawingArea {
         drag.connect_drag_begin(move |_, x, y| {
             let w = a.width().max(1) as f64;
             start_x.set(x);
-            if y < RULER_H + WAVE_H {
+            if y < RULER_H + wave_h(&app) {
                 in_wave.set(true);
                 app.seek_fraction(x / w);
             } else {
@@ -557,7 +619,7 @@ pub fn timeline(app: &Rc<App>) -> gtk::DrawingArea {
                 if !app.song_mode.get() {
                     return;
                 }
-                let lane = ((y - RULER_H - WAVE_H) / (LANE_H + LANE_GAP)).floor() as usize;
+                let lane = ((y - RULER_H - wave_h(&app)) / (lane_h(&app) + LANE_GAP)).floor() as usize;
                 let reps = app.song_reps.get().max(1);
                 let rep = ((x / w) * reps as f64).floor() as u32;
                 app.toggle_clip_at(lane, rep);
@@ -578,6 +640,7 @@ pub fn timeline(app: &Rc<App>) -> gtk::DrawingArea {
 }
 
 fn draw_timeline(app: &App, a: &gtk::DrawingArea, cr: &cairo::Context, w: f64) {
+    let (wave_h, lane_h) = (wave_h(app), lane_h(app));
     let fg = a.color();
     let (fr, fgc, fb) = (fg.red() as f64, fg.green() as f64, fg.blue() as f64);
     let l = app.loop_len();
@@ -591,6 +654,7 @@ fn draw_timeline(app: &App, a: &gtk::DrawingArea, cr: &cairo::Context, w: f64) {
     let tracks = app.tracks.borrow();
     let any_solo = tracks.iter().any(|t| t.solo);
     let maps: Vec<Option<Vec<i32>>> = tracks.iter().map(|t| app.track_map(t)).collect();
+    let envs: Vec<Option<Vec<(f32, f32)>>> = tracks.iter().map(|t| app.track_env(t)).collect();
 
     // ruler
     cr.set_font_size(10.0);
@@ -598,7 +662,7 @@ fn draw_timeline(app: &App, a: &gtk::DrawingArea, cr: &cairo::Context, w: f64) {
     for r in 0..reps {
         let x = (r as f64 / reps as f64 * w).round();
         cr.set_source_rgba(fr, fgc, fb, if r % label_every == 0 { 0.35 } else { 0.15 });
-        cr.rectangle(x, 4.0, 1.0, RULER_H + WAVE_H - 4.0);
+        cr.rectangle(x, 4.0, 1.0, RULER_H + wave_h - 4.0);
         let _ = cr.fill();
         if r % label_every == 0 && reps > 1 {
             cr.set_source_rgba(fr, fgc, fb, 0.6);
@@ -612,7 +676,7 @@ fn draw_timeline(app: &App, a: &gtk::DrawingArea, cr: &cairo::Context, w: f64) {
     let mut env = vec![0f32; cols];
     for (c, e) in env.iter_mut().enumerate() {
         let p = ((c as f64 + 0.5) / cols as f64 * song_len as f64) as u64;
-        for (t, map) in tracks.iter().zip(&maps) {
+        for ((t, map), fade) in tracks.iter().zip(&maps).zip(&envs) {
             if t.mute || (any_solo && !t.solo) {
                 continue;
             }
@@ -620,17 +684,18 @@ fn draw_timeline(app: &App, a: &gtk::DrawingArea, cr: &cairo::Context, w: f64) {
             if let Some(i) = track_index(p, l, len, map.as_deref()) {
                 let peaks = t.row.wave.peaks.borrow();
                 if !peaks.is_empty() {
-                    *e += peaks[(i * peaks.len() / len.max(1)).min(peaks.len() - 1)] * t.gain;
+                    let f = fade.as_deref().map_or(1.0, |f| crate::audio::looper::env_gain(p, l, f));
+                    *e += peaks[(i * peaks.len() / len.max(1)).min(peaks.len() - 1)] * t.gain * f;
                 }
             }
         }
     }
     let max = env.iter().cloned().fold(0.05f32, f32::max) as f64;
-    let mid = RULER_H + WAVE_H / 2.0;
+    let mid = RULER_H + wave_h / 2.0;
     let play_x = pos as f64 / song_len as f64 * w;
     for (c, e) in env.iter().enumerate() {
         let x = c as f64 * 3.0;
-        let hh = ((*e as f64 / max) * (WAVE_H / 2.0 - 4.0)).max(0.75);
+        let hh = ((*e as f64 / max) * (wave_h / 2.0 - 4.0)).max(0.75);
         if x < play_x {
             cr.set_source_rgba(0.21, 0.52, 0.89, 0.95);
         } else {
@@ -642,10 +707,10 @@ fn draw_timeline(app: &App, a: &gtk::DrawingArea, cr: &cairo::Context, w: f64) {
 
     // lanes
     if app.song_mode.get() {
-        for (i, (t, map)) in tracks.iter().zip(&maps).enumerate() {
-            let y = RULER_H + WAVE_H + 4.0 + i as f64 * (LANE_H + LANE_GAP);
+        for (i, ((t, map), fade)) in tracks.iter().zip(&maps).zip(&envs).enumerate() {
+            let y = RULER_H + wave_h + 4.0 + i as f64 * (lane_h + LANE_GAP);
             cr.set_source_rgba(fr, fgc, fb, 0.06);
-            cr.rectangle(0.0, y, w, LANE_H);
+            cr.rectangle(0.0, y, w, lane_h);
             let _ = cr.fill();
             let (r, g, b) = TRACK_COLORS[(t.id.max(1) as usize - 1) % TRACK_COLORS.len()];
             let dim = t.mute || (any_solo && !t.solo);
@@ -675,12 +740,34 @@ fn draw_timeline(app: &App, a: &gtk::DrawingArea, cr: &cairo::Context, w: f64) {
                         (false, false) => 0.85,
                     },
                 );
-                rounded(cr, x0, y + 1.0, (x1 - x0).max(2.0), LANE_H - 2.0, 5.0);
-                let _ = cr.fill();
+                rounded(cr, x0, y + 1.0, (x1 - x0).max(2.0), lane_h - 2.0, 5.0);
+                match fade.as_deref() {
+                    None => {
+                        let _ = cr.fill();
+                    }
+                    Some(f) => {
+                        // faded: the clip's shape follows its volume, the rest is a faint outline
+                        cr.save().ok();
+                        cr.clip();
+                        cr.paint_with_alpha(0.3).ok();
+                        let (top, bottom) = (y + 1.0, y + lane_h - 1.0);
+                        let level = |g: f32| bottom - (bottom - top) * g as f64;
+                        let xr = |k: usize| k as f64 / reps as f64 * w;
+                        cr.move_to(xr(rep), bottom);
+                        for (k, &(g0, g1)) in f.iter().enumerate().take(end).skip(rep) {
+                            cr.line_to(xr(k), level(g0));
+                            cr.line_to(xr(k + 1), level(g1));
+                        }
+                        cr.line_to(xr(end), bottom);
+                        cr.close_path();
+                        let _ = cr.fill();
+                        cr.restore().ok();
+                    }
+                }
                 rep = end;
             }
             cr.set_source_rgba(fr, fgc, fb, 0.75);
-            cr.move_to(4.0, y + LANE_H - 7.0);
+            cr.move_to(4.0, y + lane_h - 7.0);
             let _ = cr.show_text(&t.name);
         }
     }
@@ -688,7 +775,7 @@ fn draw_timeline(app: &App, a: &gtk::DrawingArea, cr: &cairo::Context, w: f64) {
     // playhead
     cr.set_source_rgba(0.88, 0.11, 0.14, 1.0);
     let h_total =
-        RULER_H + WAVE_H + if app.song_mode.get() { tracks.len() as f64 * (LANE_H + LANE_GAP) + 4.0 } else { 0.0 };
+        RULER_H + wave_h + if app.song_mode.get() { tracks.len() as f64 * (lane_h + LANE_GAP) + 4.0 } else { 0.0 };
     cr.rectangle(play_x.round() - 1.0, 2.0, 2.0, h_total - 2.0);
     let _ = cr.fill();
     cr.arc(play_x.round(), 4.0, 4.0, 0.0, std::f64::consts::TAU);
@@ -734,6 +821,23 @@ mod tests {
         toggle_clip(&mut clips, 2, 0, 6); // clicking the wrapped part removes it
         assert!(clips.is_empty());
         assert!(clip_covers(5, 2, 0, 6) && !clip_covers(5, 2, 1, 6));
+    }
+
+    #[test]
+    fn fades_follow_the_stretches_a_track_plays_in() {
+        assert_eq!(fade_envelope(&[0, 1, 2], 0, 0), None);
+        // plays in reps 1..=4 (and 6): fade out over 2 reps at the end of each stretch
+        let map = [-1, 1, 2, 3, 4, -1, 6];
+        let e = fade_envelope(&map, 0, 2).unwrap();
+        assert_eq!(e[1], (1.0, 1.0));
+        assert_eq!(e[3], (1.0, 0.5));
+        assert_eq!(e[4], (0.5, 0.0));
+        assert_eq!(e[6], (0.5, 0.0), "a 1-rep stretch with a 2-rep fade starts at half volume");
+        let e = fade_envelope(&map, 1, 0).unwrap();
+        assert_eq!(e[1], (0.0, 1.0));
+        assert_eq!(e[2], (1.0, 1.0));
+        assert_eq!(crate::audio::looper::env_gain(1500, 1000, &fade_envelope(&map, 0, 2).unwrap()), 1.0);
+        assert_eq!(crate::audio::looper::env_gain(4500, 1000, &fade_envelope(&map, 0, 2).unwrap()), 0.25);
     }
 
     #[test]
